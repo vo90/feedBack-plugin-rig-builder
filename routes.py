@@ -938,21 +938,12 @@ def _get_conn_locked() -> sqlite3.Connection:
             _migrate_rehome_bundled_vst_paths()
         except Exception:
             log.exception("bundled-VST path re-home failed")
-        # Plugin rename: old installs stored bundled VST absolute paths under
-        # plugins/nam_rig_builder/. The active plugin dir is rig_builder, and
-        # the old directory may no longer exist, so normalize those paths before
-        # applying bundle/subdir migrations below.
+        # Preserve legacy rename/reorganization repairs without scanning the
+        # entire preset table once for every historical bundle name.
         try:
-            _conn.execute(
-                "UPDATE preset_pieces "
-                "SET vst_path = REPLACE(vst_path, ?, ?) "
-                "WHERE vst_path LIKE ?",
-                ("/plugins/nam_rig_builder/",
-                 "/plugins/rig_builder/",
-                 "%/plugins/nam_rig_builder/%"),
-            )
+            _migrate_legacy_vst_paths()
         except Exception:
-            log.exception("plugin-dir VST path migration failed")
+            log.exception("legacy VST path migration failed")
         # IR/cab rows must not carry a stale VST path. Older assign flows could
         # leave vst_path populated while changing the row back to kind='ir' or
         # kind='rs_ir', which made the Gear tab try to open an unrelated VST for
@@ -966,43 +957,6 @@ def _get_conn_locked() -> sqlite3.Connection:
             )
         except Exception:
             log.exception("stale cab/IR VST cleanup failed")
-        # Renamed bundled VSTs: rewrite stored vst_path basenames old->new so
-        # per-song assignments survive the rename. Idempotent — REPLACE matches
-        # the full trailing "/<old>.vst3" segment, so it's a no-op once migrated.
-        try:
-            for old, new in _RENAMED_VST_BUNDLES.items():
-                _conn.execute(
-                    "UPDATE preset_pieces SET vst_path = REPLACE(vst_path, ?, ?) "
-                    "WHERE vst_path LIKE ?", (f"/{old}", f"/{new}", f"%/{old}"))
-        except Exception:
-            log.exception("renamed-VST path migration failed")
-        # vst/ folder reorg: bundles moved from a flat vst/<name>.vst3 into
-        # category subdirs (vst/amps|pedals|racks/<name>.vst3). Rewrite stored
-        # absolute paths so existing per-song assignments survive the move.
-        # Driven by the seed catalog's now-subdir'd `bundled` paths and
-        # idempotent (the flat "/vst/<name>" segment no longer matches once a
-        # path has been moved under a subdir).
-        try:
-            seed = _load_vst_seed_catalog() or {}
-            seen = set()
-            for arr in seed.values():
-                if not isinstance(arr, list):
-                    continue
-                for e in arr:
-                    b = (isinstance(e, dict) and e.get("bundled")) or ""
-                    parts = b.split("/")
-                    if (len(parts) == 3 and parts[0] == "vst"
-                            and parts[2].endswith((".vst3", ".component"))):
-                        fn = parts[2]
-                        if fn in seen:
-                            continue
-                        seen.add(fn)
-                        _conn.execute(
-                            "UPDATE preset_pieces SET vst_path = REPLACE(vst_path, ?, ?) "
-                            "WHERE vst_path LIKE ?",
-                            (f"/vst/{fn}", f"/{b}", f"%/vst/{fn}"))
-        except Exception:
-            log.exception("vst subdir path migration failed")
         _conn.commit()
         # v1.2 storage migration. Idempotent — guarded by sentinel file
         # so re-running on subsequent restarts is a no-op. Done here
@@ -1128,6 +1082,44 @@ def _migrate_rehome_bundled_vst_paths() -> None:
         log.info("re-homed %d bundled VST path(s) to %s", fixed, str(vst_root))
 
 
+def _migrate_legacy_vst_paths() -> None:
+    """Apply old plugin, bundle and category renames in one table pass.
+
+    Many song pieces share a VST path. Transform each distinct path once,
+    keeping the historical rewrite order, then update only changed rows by ID.
+    Current libraries therefore do no writes regardless of their song count.
+    """
+    rewrites = [(f"/{old}", f"/{new}")
+                for old, new in _RENAMED_VST_BUNDLES.items()]
+    seen = set()
+    for entries in (_load_vst_seed_catalog() or {}).values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            bundled = (isinstance(entry, dict) and entry.get("bundled")) or ""
+            parts = bundled.split("/")
+            if (len(parts) == 3 and parts[0] == "vst"
+                    and parts[2].endswith((".vst3", ".component"))
+                    and parts[2] not in seen):
+                seen.add(parts[2])
+                rewrites.append((f"/vst/{parts[2]}", f"/{bundled}"))
+    paths = {}
+    updates = []
+    for piece_id, original in _conn.execute(
+            "SELECT id, vst_path FROM preset_pieces "
+            "WHERE vst_path IS NOT NULL AND vst_path != ''"):
+        if original not in paths:
+            path = original.replace("/plugins/nam_rig_builder/",
+                                    "/plugins/rig_builder/")
+            for old, new in rewrites:
+                if path.lower().endswith(old.lower()):
+                    path = path.replace(old, new)
+            paths[original] = path
+        if paths[original] != original:
+            updates.append((paths[original], piece_id))
+    _conn.executemany("UPDATE preset_pieces SET vst_path = ? WHERE id = ?", updates)
+
+
 def _migrate_output_gain_to_unity() -> None:
     """One-shot backfill: any user-song preset still at the legacy
     output_gain=0.5 default (set silently by older rig_builder versions
@@ -1245,13 +1237,16 @@ def _migrate_assign_bundled_primary_once() -> None:
         "FROM preset_pieces"
     ).fetchall()
     changed = 0
+    primary_by_gear = {}
     for pid, gear, pj, cur, mode, kind in rows:
         if not gear or _gear_category(gear) == "cab":
             continue
         # Amps flip to a bundled VST only when one is actually installed for
         # the gear (rs_gear_to_vst.json); _pick_installed_primary_vst returns
         # None for amps without a bundled VST, so they keep their NAM below.
-        pick = _pick_installed_primary_vst(gear, known)
+        if gear not in primary_by_gear:
+            primary_by_gear[gear] = _pick_installed_primary_vst(gear, known)
+        pick = primary_by_gear[gear]
         if not pick:
             continue
         bundled = pick["vst_path"]
@@ -1259,7 +1254,10 @@ def _migrate_assign_bundled_primary_once() -> None:
         # A piece with the right vst_path but kind='none' (e.g. its NAM file was
         # deleted and the file-missing cleanup blanked the kind) must still be
         # repaired to kind='vst' — otherwise the amp shows up dead/unloadable.
-        if cur == bundled and kind == "vst":
+        # Re-home emits forward slashes, while Path stringification uses
+        # backslashes on Windows. Compare native paths so every launch does
+        # not reset already-resolved pieces and their saved parameter state.
+        if cur and Path(cur) == Path(bundled) and kind == "vst":
             continue
         cur_broken = bool(cur) and not Path(cur).exists()
         # Respect a deliberate manual pick that still resolves — a manual NAM
