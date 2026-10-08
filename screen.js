@@ -1352,7 +1352,7 @@ async function rbPreLoadMute(chainLen, targetGain, opts) {
         try {
             const hw = window.highway;
             if (!hw || typeof hw.getTime !== 'function') return null;
-            const t = hw.getTime();
+            const t = hw.getPresentationTime ? hw.getPresentationTime() : hw.getTime();
             const changes = hw.getToneChanges ? hw.getToneChanges() : [];
             const base = hw.getToneBase ? hw.getToneBase() : '';
             let active = base;
@@ -2622,7 +2622,7 @@ const RbMegaChain = (function () {
         try {
             const hw = window.highway;
             if (!hw || typeof hw.getTime !== 'function') return null;
-            const t = hw.getTime();
+            const t = hw.getPresentationTime ? hw.getPresentationTime() : hw.getTime();
             const changes = hw.getToneChanges ? hw.getToneChanges() : [];
             const base = hw.getToneBase ? hw.getToneBase() : '';
             let active = base;
