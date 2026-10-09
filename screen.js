@@ -1715,6 +1715,12 @@ function rbBuildAudioEffectsRequestFromPayload(payload, options) {
     return { plan, assets, chain };
 }
 
+// A local load already fetched its tone data. Hand that exact response through
+// the provider once, instead of rebuilding it over HTTP a second time. These
+// entries exist only for the outstanding host call; this is not a preset cache.
+const rbPendingEffectsPayloads = new Map();
+let rbEffectsPayloadSequence = 0;
+
 async function rbFetchAudioEffectsPayloadForRequest(request) {
     const target = request && request.target && typeof request.target === 'object' ? request.target : {};
     const planRequest = request && request.planRequest && typeof request.planRequest === 'object' ? request.planRequest : {};
@@ -1722,6 +1728,16 @@ async function rbFetchAudioEffectsPayloadForRequest(request) {
     const presetId = target.presetId || target.preset_id || request && request.presetId || planRequest.presetId || rbPresetIdFromProviderRef(providerRef);
     if (providerRef && !presetId) {
         return { outcome: 'no-target', status: 'invalid-provider-ref', reason: 'Rig Builder audio-effects request had an invalid provider ref' };
+    }
+    const filename = target.filename || request && request.filename || planRequest.filename || rbState.currentSongFile;
+    if (planRequest.resolvedPayloadRef) {
+        const entry = rbPendingEffectsPayloads.get(planRequest.resolvedPayloadRef);
+        const key = presetId != null && presetId !== '' ? `preset:${presetId}` : `song:${filename}`;
+        if (!entry || entry.key !== key) {
+            return { outcome: 'no-target', status: 'expired-payload', reason: 'Rig Builder local tone response is no longer available for this target' };
+        }
+        rbPendingEffectsPayloads.delete(planRequest.resolvedPayloadRef);
+        return { outcome: 'handled', payload: entry.payload, mode: entry.mode, ref: entry.ref };
     }
     if (presetId != null && presetId !== '') {
         const resp = await fetch(`${RB_API}/native_preset_full/${encodeURIComponent(presetId)}`);
@@ -1731,7 +1747,6 @@ async function rbFetchAudioEffectsPayloadForRequest(request) {
         catch (_) { return { outcome: 'failed', status: 'invalid-response', reason: 'Rig Builder preset plan response was not valid JSON' }; }
         return { outcome: 'handled', payload, mode: 'full-chain', ref: presetId };
     }
-    const filename = target.filename || request && request.filename || planRequest.filename || rbState.currentSongFile;
     if (filename) {
         const resp = await fetch(`${RB_API}/mega_chain/${encodeURIComponent(filename)}`);
         if (!resp.ok) return { outcome: 'no-target', status: 'song-unavailable', reason: `Rig Builder song chain unavailable: HTTP ${resp.status}` };
@@ -1760,23 +1775,36 @@ async function rbLoadChainPlanWithHost(payload, options) {
     const targetPresetId = opts.presetId || (payload && payload.id);
     const targetFilename = opts.filename || (opts.mode === 'mega-chain' ? rbState.currentSongFile : '');
     if (!targetPresetId && !targetFilename) return null;
-    const result = await audioEffects.loadPlan({
-        authorization: opts.authorization || 'user-action',
-        routeKey: RB_EFFECTS_ROUTE_KEY,
-        providerId: RB_EFFECTS_PARTICIPANT_ID,
-        target: {
-            presetId: targetPresetId,
-            providerRef: targetPresetId ? rbPresetProviderRef(targetPresetId) : '',
-            filename: targetFilename,
-            source: 'rig-builder-ui',
-        },
-        planRequest: {
-            mode: opts.mode || 'native',
-            ref: opts.ref || payload && payload.id || '',
-        },
-        options: opts.executorOptions || {},
-    }, RB_PLUGIN_ID);
-    return rbHandledAudioEffectsResult(result, 'Rig Builder audio-effects host load failed');
+    const resolvedPayloadRef = payload && Array.isArray(payload.native_preset?.chain)
+        ? `rb-load-${++rbEffectsPayloadSequence}` : '';
+    if (resolvedPayloadRef) rbPendingEffectsPayloads.set(resolvedPayloadRef, {
+        key: targetPresetId ? `preset:${targetPresetId}` : `song:${targetFilename}`,
+        payload,
+        mode: targetPresetId ? 'full-chain' : 'mega-chain',
+        ref: targetPresetId || 'song',
+    });
+    try {
+        const result = await audioEffects.loadPlan({
+            authorization: opts.authorization || 'user-action',
+            routeKey: RB_EFFECTS_ROUTE_KEY,
+            providerId: RB_EFFECTS_PARTICIPANT_ID,
+            target: {
+                presetId: targetPresetId,
+                providerRef: targetPresetId ? rbPresetProviderRef(targetPresetId) : '',
+                filename: targetFilename,
+                source: 'rig-builder-ui',
+            },
+            planRequest: {
+                mode: opts.mode || 'native',
+                ref: opts.ref || payload && payload.id || '',
+                resolvedPayloadRef,
+            },
+            options: opts.executorOptions || {},
+        }, RB_PLUGIN_ID);
+        return rbHandledAudioEffectsResult(result, 'Rig Builder audio-effects host load failed');
+    } finally {
+        rbPendingEffectsPayloads.delete(resolvedPayloadRef);
+    }
 }
 
 async function rbReleaseAudioEffectsRouteWithHost(reason) {
