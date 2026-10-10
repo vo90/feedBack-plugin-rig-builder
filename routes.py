@@ -7960,18 +7960,29 @@ def _watch_scan_dlc() -> dict[str, int] | None:
         return None
     current: dict[str, int] = {}
     try:
+        # The root is invariant within a scan. Resolving it through
+        # _dlc_relative_song_key for every song rereads the config and resolves
+        # the same directory thousands of times on large libraries. Keep the
+        # per-file resolution: symlinks outside the root must still be rejected.
+        resolved_dlc = dlc.resolve()
         for p in dlc.rglob("*"):
             if not p.is_file():
                 continue
             if not _is_song_pack(p):
                 continue
             try:
-                key = _dlc_relative_song_key(p)
+                key = p.resolve().relative_to(resolved_dlc).as_posix()
                 if not key:
                     continue
                 current[key] = p.stat().st_size
-            except OSError:
+            except (OSError, ValueError):
                 continue
+        # A setting change or retargeted root junction during the walk must not
+        # publish a partial snapshot of the old library. Returning unavailable
+        # leaves the watcher's baseline/pending entries intact until next tick.
+        selected_dlc = _get_dlc_dir() if _get_dlc_dir else None
+        if not selected_dlc or selected_dlc.resolve() != resolved_dlc:
+            return None
     except OSError:
         return None
     return current
