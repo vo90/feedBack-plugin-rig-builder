@@ -351,23 +351,21 @@ def test_ordinary_file_resolution_scales_with_parent_count_and_preserves_order(
     assert all(not routes._is_song_pack(path) for path in resolutions)
 
 
-def test_file_replaced_with_reparse_after_type_check_is_fully_resolved(
+def test_file_replaced_with_reparse_after_enumeration_is_fully_resolved(
     routes, tmp_path, monkeypatch
 ):
     dlc = tmp_path / "library"
     song = _write(dlc, "song.feedpak")
     outside = _write(tmp_path / "outside", "secret.feedpak")
     routes._get_dlc_dir = lambda: dlc
-    original_is_file, original_lstat, original_resolve = Path.is_file, Path.lstat, Path.resolve
+    original_lstat, original_resolve = Path.lstat, Path.resolve
     replaced = False
     fresh_checks = []
 
-    def is_file(path):
+    def walk(path, pattern):
         nonlocal replaced
-        result = original_is_file(path)
-        if path == song:
-            replaced = True
-        return result
+        replaced = True
+        yield song
 
     def lstat(path, *args, **kwargs):
         info = original_lstat(path, *args, **kwargs)
@@ -383,11 +381,11 @@ def test_file_replaced_with_reparse_after_type_check_is_fully_resolved(
             return outside
         return original_resolve(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.setattr(Path, "rglob", walk)
     monkeypatch.setattr(Path, "lstat", lstat)
     monkeypatch.setattr(Path, "resolve", resolve)
     assert routes._watch_scan_dlc() == {}
-    assert fresh_checks == [song]
+    assert fresh_checks and all(path == song for path in fresh_checks)
 
 
 @pytest.mark.parametrize("parent_name", ["", "nested"])
@@ -436,15 +434,111 @@ def test_type_check_permission_error_preserves_unavailable_scan(routes, tmp_path
     dlc = tmp_path / "library"
     blocked = _write(dlc, name)
     routes._get_dlc_dir = lambda: dlc
-    original_is_file = Path.is_file
+    original_stat = Path.stat
 
-    def is_file(path):
+    def path_stat(path, *args, **kwargs):
         if path == blocked:
             raise PermissionError("file type cannot be read")
-        return original_is_file(path)
+        return original_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.setattr(Path, "stat", path_stat)
     assert routes._watch_scan_dlc() is _legacy_scan(routes) is None
+
+
+def test_ordinary_files_reuse_fresh_type_metadata_after_parent_snapshot(routes, tmp_path, monkeypatch):
+    dlc = tmp_path / "library"
+    root_song = _write(dlc, "root.feedpak", b"root")
+    first = _write(dlc, "nested/first.feedpak", b"first")
+    second = _write(dlc, "nested/second.feedpak", b"second")
+    songs = (root_song, first, second)
+    routes._get_dlc_dir = lambda: dlc
+    calls = []
+    original_stat = Path.stat
+
+    def path_stat(path, *args, **kwargs):
+        if path in songs:
+            calls.append((path, kwargs.get("follow_symlinks", True)))
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "rglob", lambda path, pattern: iter(songs))
+    monkeypatch.setattr(Path, "stat", path_stat)
+    assert list(routes._watch_scan_dlc().items()) == [
+        ("root.feedpak", 4), ("nested/first.feedpak", 5), ("nested/second.feedpak", 6),
+    ]
+    # Existing parent identities permit one read; a new parent needs another
+    # fresh read after its identity is captured. No follow-stat for these files.
+    assert calls == [(root_song, False), (first, False), (first, False), (second, False)]
+
+
+def test_parent_replaced_before_first_identity_uses_new_file_metadata(routes, tmp_path, monkeypatch):
+    dlc = tmp_path / "library"
+    parent = dlc / "nested"
+    song = _write(parent, "song.feedpak", b"old")
+    routes._get_dlc_dir = lambda: dlc
+    original_snapshot = routes._watch_directory_snapshot
+    replaced = False
+
+    def snapshot(path):
+        nonlocal replaced
+        if path == parent and not replaced:
+            parent.rename(tmp_path / "original-directory")
+            _write(parent, song.name, b"replacement")
+            replaced = True
+        return original_snapshot(path)
+
+    monkeypatch.setattr(Path, "rglob", lambda path, pattern: iter((song,)))
+    monkeypatch.setattr(routes, "_watch_directory_snapshot", snapshot)
+    assert routes._watch_scan_dlc() == {"nested/song.feedpak": 11}
+
+
+def test_first_file_reparse_change_during_parent_snapshot_is_fully_resolved(routes, tmp_path, monkeypatch):
+    dlc = tmp_path / "library"
+    song = _write(dlc, "nested/song.feedpak")
+    outside = _write(tmp_path / "outside", "external.feedpak")
+    routes._get_dlc_dir = lambda: dlc
+    original_snapshot = routes._watch_directory_snapshot
+    original_lstat, original_resolve = Path.lstat, Path.resolve
+    replaced = False
+
+    def snapshot(path):
+        nonlocal replaced
+        result = original_snapshot(path)
+        if path == song.parent:
+            replaced = True
+        return result
+
+    def lstat(path, *args, **kwargs):
+        info = original_lstat(path, *args, **kwargs)
+        if path == song and replaced:
+            return SimpleNamespace(st_mode=stat.S_IFREG, st_size=4,
+                                   st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        return info
+
+    def resolve(path, *args, **kwargs):
+        return outside if path == song and replaced else original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(routes, "_watch_directory_snapshot", snapshot)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert routes._watch_scan_dlc() == {}
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError(2, "gone"), ValueError("bad path")])
+def test_initial_no_follow_failure_retains_pathlib_missing_file_behavior(routes, tmp_path, monkeypatch, error):
+    dlc = tmp_path / "library"
+    good = _write(dlc, "good.feedpak")
+    missing = dlc / "missing.feedpak"
+    routes._get_dlc_dir = lambda: dlc
+    original_lstat = Path.lstat
+
+    def lstat(path, *args, **kwargs):
+        if path == missing:
+            raise error
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "rglob", lambda path, pattern: iter((missing, good)))
+    monkeypatch.setattr(Path, "lstat", lstat)
+    assert routes._watch_scan_dlc() == _legacy_scan(routes) == {"good.feedpak": 4}
 
 
 def test_parent_cache_preserves_case_distinct_spellings(routes, tmp_path, monkeypatch):

@@ -7982,8 +7982,22 @@ def _watch_scan_dlc() -> dict[str, int] | None:
         # before publishing so a retargeted/replaced directory cannot supply
         # keys using its old canonical location.
         for p in dlc.rglob("*"):
-            # Preserve the old file-type/error behavior before suffix filtering.
-            if not p.is_file():
+            # A fresh no-follow stat can establish both type and size for an
+            # ordinary file. Do not reuse DirEntry metadata: a file can be
+            # replaced with a reparse point after directory enumeration.
+            info = None
+            ordinary_file = False
+            try:
+                info = p.lstat()
+                attributes = getattr(info, "st_file_attributes", None)
+                ordinary_file = stat.S_ISREG(info.st_mode) and not (
+                    (attributes or 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                ) and (os.name != "nt" or attributes is not None)
+            except (OSError, ValueError):
+                pass
+            # Uncertain types and errors retain pathlib's follow/error rules,
+            # including permission errors before the suffix filter.
+            if not ordinary_file and not p.is_file():
                 continue
             if not _is_song_pack(p):
                 continue
@@ -7991,10 +8005,13 @@ def _watch_scan_dlc() -> dict[str, int] | None:
             parent_key = str(parent)
             if parent_key not in directories:
                 directories[parent_key] = (parent, _watch_directory_snapshot(parent))
+                # The first stat preceded this parent's identity snapshot.
+                # Re-read after it so a replaced parent cannot contribute an
+                # old file size under its new canonical directory identity.
+                ordinary_file = False
             try:
-                # A fresh no-follow stat is intentional: cached DirEntry
-                # metadata can miss a file replaced with a symlink mid-scan.
-                info = p.lstat()
+                if not ordinary_file:
+                    info = p.lstat()
                 attributes = getattr(info, "st_file_attributes", None)
                 reparse = stat.S_ISLNK(info.st_mode) or bool(
                     (attributes or 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
