@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import stat
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -46,6 +50,22 @@ def _legacy_scan(routes):
     except OSError:
         return None
     return current
+
+
+def _mark_reparse(monkeypatch, *paths):
+    """Exercise non-symlink Windows reparse tags without requiring a cloud driver."""
+    original_lstat = Path.lstat
+
+    def lstat(path, *args, **kwargs):
+        info = original_lstat(path, *args, **kwargs)
+        if path in paths:
+            return SimpleNamespace(
+                st_mode=info.st_mode, st_size=info.st_size,
+                st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+            )
+        return info
+
+    monkeypatch.setattr(Path, "lstat", lstat)
 
 
 def test_scan_matches_legacy_nested_paths_and_extension_case(routes, tmp_path):
@@ -153,6 +173,7 @@ def test_per_file_resolved_target_is_still_checked(routes, tmp_path, monkeypatch
     outside = _write(tmp_path / "outside", "external.feedpak")
     routes._get_dlc_dir = lambda: dlc
     original_resolve = Path.resolve
+    _mark_reparse(monkeypatch, linked)
 
     def resolve(path, *args, **kwargs):
         # Exercise the containment guard even on hosts lacking symlink rights.
@@ -160,6 +181,31 @@ def test_per_file_resolved_target_is_still_checked(routes, tmp_path, monkeypatch
 
     monkeypatch.setattr(Path, "resolve", resolve)
     assert routes._watch_scan_dlc() == _legacy_scan(routes) == {inside.name: 4}
+
+
+def test_outside_reparse_target_is_rejected_before_target_size_stat(routes, tmp_path, monkeypatch):
+    dlc = tmp_path / "library"
+    linked = _write(dlc, "linked.feedpak")
+    outside = _write(tmp_path / "outside", "external.feedpak")
+    routes._get_dlc_dir = lambda: dlc
+    original_resolve, original_stat = Path.resolve, Path.stat
+    _mark_reparse(monkeypatch, linked)
+    target_stats = []
+
+    def resolve(path, *args, **kwargs):
+        return outside if path == linked else original_resolve(path, *args, **kwargs)
+
+    def path_stat(path, *args, **kwargs):
+        if path == linked and kwargs.get("follow_symlinks", True):
+            target_stats.append(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    monkeypatch.setattr(Path, "stat", path_stat)
+    assert routes._watch_scan_dlc() == {}
+    # The initial is_file() still stats the target, exactly as before, but no
+    # target-size stat is performed after the containment check fails.
+    assert target_stats == [linked]
 
 
 def _symlink(link, target, *, directory=False):
@@ -243,6 +289,7 @@ def test_per_file_resolution_error_skips_only_that_candidate(routes, tmp_path, m
     broken = _write(dlc, "broken.feedpak")
     routes._get_dlc_dir = lambda: dlc
     original_resolve = Path.resolve
+    _mark_reparse(monkeypatch, broken)
 
     def resolve(path, *args, **kwargs):
         if path == broken:
@@ -278,3 +325,270 @@ def test_materialization_growth_re_stubbing_and_removal_keep_existing_stability_
     _write(dlc, "new.FEEDPAK", b"new")
     assert routes._watch_tick() == []
     assert routes._watch_tick() == ["new.FEEDPAK"]
+
+
+@pytest.mark.parametrize("file_count", [24, 1024])
+def test_ordinary_file_resolution_scales_with_parent_count_and_preserves_order(
+    routes, tmp_path, monkeypatch, file_count
+):
+    dlc = tmp_path / "library"
+    for index in range(file_count):
+        _write(dlc, f"artist{index % 3}/album/{index}.feedpak", b"x" * index)
+    routes._get_dlc_dir = lambda: dlc
+    expected = _legacy_scan(routes)
+    resolutions = []
+    original_resolve = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        resolutions.append(path)
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    actual = routes._watch_scan_dlc()
+    assert list(actual.items()) == list(expected.items())
+    # Root plus three file parents, each resolved once and revalidated once.
+    assert len(resolutions) == 8
+    assert all(not routes._is_song_pack(path) for path in resolutions)
+
+
+def test_file_replaced_with_reparse_after_type_check_is_fully_resolved(
+    routes, tmp_path, monkeypatch
+):
+    dlc = tmp_path / "library"
+    song = _write(dlc, "song.feedpak")
+    outside = _write(tmp_path / "outside", "secret.feedpak")
+    routes._get_dlc_dir = lambda: dlc
+    original_is_file, original_lstat, original_resolve = Path.is_file, Path.lstat, Path.resolve
+    replaced = False
+    fresh_checks = []
+
+    def is_file(path):
+        nonlocal replaced
+        result = original_is_file(path)
+        if path == song:
+            replaced = True
+        return result
+
+    def lstat(path, *args, **kwargs):
+        info = original_lstat(path, *args, **kwargs)
+        if path == song:
+            assert replaced
+            fresh_checks.append(path)
+            return SimpleNamespace(st_mode=stat.S_IFREG, st_size=4,
+                                   st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        return info
+
+    def resolve(path, *args, **kwargs):
+        if path == song and replaced:
+            return outside
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert routes._watch_scan_dlc() == {}
+    assert fresh_checks == [song]
+
+
+@pytest.mark.parametrize("parent_name", ["", "nested"])
+def test_replaced_directory_identity_discards_snapshot(routes, tmp_path, monkeypatch, parent_name):
+    dlc = tmp_path / "library"
+    parent = dlc / parent_name
+    song = _write(parent, "song.feedpak")
+    old_inode = parent.stat().st_ino
+    routes._get_dlc_dir = lambda: dlc
+
+    def changed_walk(path, pattern):
+        yield song
+        parent.rename(tmp_path / "original-directory")
+        parent.mkdir()
+        assert parent.stat().st_ino != old_inode
+
+    monkeypatch.setattr(Path, "rglob", changed_walk)
+    assert routes._watch_scan_dlc() is None
+
+
+def test_retargeted_nested_directory_discards_snapshot(routes, tmp_path, monkeypatch):
+    dlc = tmp_path / "library"
+    parent = dlc / "nested"
+    song = _write(parent, "song.feedpak")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    routes._get_dlc_dir = lambda: dlc
+    original_resolve = Path.resolve
+    changed = False
+
+    def changed_walk(path, pattern):
+        nonlocal changed
+        yield song
+        changed = True
+
+    def resolve(path, *args, **kwargs):
+        return outside if path == parent and changed else original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "rglob", changed_walk)
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert routes._watch_scan_dlc() is None
+
+
+@pytest.mark.parametrize("name", ["song.feedpak", "irrelevant.txt"])
+def test_type_check_permission_error_preserves_unavailable_scan(routes, tmp_path, monkeypatch, name):
+    dlc = tmp_path / "library"
+    blocked = _write(dlc, name)
+    routes._get_dlc_dir = lambda: dlc
+    original_is_file = Path.is_file
+
+    def is_file(path):
+        if path == blocked:
+            raise PermissionError("file type cannot be read")
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    assert routes._watch_scan_dlc() is _legacy_scan(routes) is None
+
+
+def test_parent_cache_preserves_case_distinct_spellings(routes, tmp_path, monkeypatch):
+    dlc = tmp_path / "library"
+    upper = _write(dlc, "A/upper.feedpak")
+    lower = _write(dlc, "a/lower.feedpak")
+    routes._get_dlc_dir = lambda: dlc
+    original_resolve = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        # Emulate a Windows case-sensitive directory without changing host policy.
+        if str(path) in (str(upper.parent), str(lower.parent)):
+            return path
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "rglob", lambda path, pattern: iter((upper, lower)))
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert list(routes._watch_scan_dlc()) == ["A/upper.feedpak", "a/lower.feedpak"]
+
+
+def test_unavailable_parent_identity_uses_full_file_resolution(routes, tmp_path, monkeypatch):
+    dlc = tmp_path / "library"
+    song = _write(dlc, "song.feedpak")
+    outside = _write(tmp_path / "outside", "external.feedpak")
+    routes._get_dlc_dir = lambda: dlc
+    original_snapshot, original_resolve = routes._watch_directory_snapshot, Path.resolve
+
+    def snapshot(path):
+        canonical, device, _ = original_snapshot(path)
+        return canonical, device, 0
+
+    def resolve(path, *args, **kwargs):
+        return outside if path == song else original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(routes, "_watch_directory_snapshot", snapshot)
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert routes._watch_scan_dlc() == {}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse metadata fallback")
+def test_missing_reparse_attributes_uses_full_file_resolution(routes, tmp_path, monkeypatch):
+    dlc = tmp_path / "library"
+    song = _write(dlc, "song.feedpak")
+    outside = _write(tmp_path / "outside", "external.feedpak")
+    routes._get_dlc_dir = lambda: dlc
+    original_resolve, original_lstat = Path.resolve, Path.lstat
+
+    def lstat(path, *args, **kwargs):
+        info = original_lstat(path, *args, **kwargs)
+        if path == song:
+            return SimpleNamespace(st_mode=info.st_mode, st_size=info.st_size)
+        return info
+
+    def resolve(path, *args, **kwargs):
+        return outside if path == song else original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert routes._watch_scan_dlc() == {}
+
+
+@pytest.fixture
+def junctions():
+    if os.name != "nt":
+        pytest.skip("Windows junction behavior")
+    created = []
+
+    def create(link, target):
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                       check=True, capture_output=True)
+        assert link.is_junction()
+        created.append(link)
+        return link
+
+    yield create
+    for link in reversed(created):
+        # Remove only the junction itself, never recursively touch its target.
+        if link.is_junction():
+            os.rmdir(link)
+
+
+def test_windows_junction_root_nested_and_outside_match_legacy(routes, tmp_path, junctions):
+    target = tmp_path / "target"
+    _write(target, "nested/song.feedpak")
+    _write(target, "root.sloppak", b"root")
+    outside = tmp_path / "outside"
+    _write(outside, "external.feedpak")
+    junctions(target / "inside-junction", target / "nested")
+    junctions(target / "outside-junction", outside)
+    root = junctions(tmp_path / "library", target)
+    routes._get_dlc_dir = lambda: root
+    expected = _legacy_scan(routes)
+    assert list(routes._watch_scan_dlc().items()) == list(expected.items())
+    assert expected == {"root.sloppak": 4, "nested/song.feedpak": 4}
+
+
+def test_windows_outside_junction_keeps_inward_reparse_alias(
+    routes, tmp_path, junctions, monkeypatch
+):
+    dlc = tmp_path / "library"
+    inside = _write(dlc, "target.txt", b"inside")
+    outside = tmp_path / "outside"
+    _write(outside, "alias.feedpak", b"alias")
+    link = junctions(dlc / "outside-junction", outside)
+    alias = link / "alias.feedpak"
+    routes._get_dlc_dir = lambda: dlc
+    original_resolve, original_stat = Path.resolve, Path.stat
+    _mark_reparse(monkeypatch, alias)
+
+    def resolve(path, *args, **kwargs):
+        return inside if path == alias else original_resolve(path, *args, **kwargs)
+
+    def path_stat(path, *args, **kwargs):
+        if path == alias and kwargs.get("follow_symlinks", True):
+            return original_stat(inside, *args, **kwargs)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    monkeypatch.setattr(Path, "stat", path_stat)
+    assert routes._watch_scan_dlc() == _legacy_scan(routes) == {"target.txt": 6}
+
+
+@pytest.mark.parametrize("root_alias", [False, True])
+def test_windows_junction_retarget_during_scan_is_unavailable(
+    routes, tmp_path, junctions, monkeypatch, root_alias
+):
+    target = tmp_path / "target"
+    _write(target, "song.feedpak")
+    replacement = tmp_path / "replacement"
+    _write(replacement, "other.feedpak")
+    dlc = tmp_path / "library"
+    if root_alias:
+        link = junctions(dlc, target)
+    else:
+        dlc.mkdir()
+        link = junctions(dlc / "nested", target)
+    song = link / "song.feedpak"
+    routes._get_dlc_dir = lambda: dlc
+
+    def changed_walk(path, pattern):
+        yield song
+        assert link.is_junction()
+        os.rmdir(link)
+        junctions(link, replacement)
+
+    monkeypatch.setattr(Path, "rglob", changed_walk)
+    assert routes._watch_scan_dlc() is None

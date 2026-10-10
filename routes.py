@@ -27,6 +27,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -7950,8 +7951,17 @@ _watcher_state: dict = {
 }
 
 
+def _watch_directory_snapshot(path: Path) -> tuple[Path, int, int]:
+    """Canonical directory and identity, refreshed rather than DirEntry-cached."""
+    resolved = path.resolve()
+    info = path.stat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise NotADirectoryError(str(path))
+    return resolved, info.st_dev, info.st_ino
+
+
 def _watch_scan_dlc() -> dict[str, int] | None:
-    """Return {relative_dlc_path: size} for every PSARC/sloppak in the DLC dir,
+    """Return {relative_dlc_path: size} for every feedpak/sloppak in the DLC dir,
     or None if the dir isn't available. RECURSIVE — picks up files
     nested in subfolders (artist-based, converter output, or any other
     organisation)."""
@@ -7960,28 +7970,64 @@ def _watch_scan_dlc() -> dict[str, int] | None:
         return None
     current: dict[str, int] = {}
     try:
-        # The root is invariant within a scan. Resolving it through
-        # _dlc_relative_song_key for every song rereads the config and resolves
-        # the same directory thousands of times on large libraries. Keep the
-        # per-file resolution: symlinks outside the root must still be rejected.
-        resolved_dlc = dlc.resolve()
+        root_snapshot = _watch_directory_snapshot(dlc)
+        resolved_dlc = root_snapshot[0]
+        # Path equality folds case on Windows, even in a case-sensitive
+        # directory. Preserve each enumerated spelling as a distinct cache key.
+        root_key = str(dlc)
+        directories = {root_key: (dlc, root_snapshot)}
+        # Keep pathlib's traversal and ordering, including its treatment of
+        # directory symlinks/junctions. Only the repeated ancestor resolution
+        # of ordinary files is avoided. Revalidate every candidate parent
+        # before publishing so a retargeted/replaced directory cannot supply
+        # keys using its old canonical location.
         for p in dlc.rglob("*"):
+            # Preserve the old file-type/error behavior before suffix filtering.
             if not p.is_file():
                 continue
             if not _is_song_pack(p):
                 continue
+            parent = p.parent
+            parent_key = str(parent)
+            if parent_key not in directories:
+                directories[parent_key] = (parent, _watch_directory_snapshot(parent))
             try:
-                key = p.resolve().relative_to(resolved_dlc).as_posix()
+                # A fresh no-follow stat is intentional: cached DirEntry
+                # metadata can miss a file replaced with a symlink mid-scan.
+                info = p.lstat()
+                attributes = getattr(info, "st_file_attributes", None)
+                reparse = stat.S_ISLNK(info.st_mode) or bool(
+                    (attributes or 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                )
+                resolved_parent, _, parent_inode = directories[parent_key][1]
+                resolve_file = reparse or not parent_inode or (os.name == "nt" and attributes is None)
+                if resolve_file:
+                    # All reparse tags (not only symlinks), and files on a
+                    # filesystem without a usable parent identity, retain the
+                    # full per-file containment check and target stat.
+                    resolved_file = p.resolve()
+                else:
+                    resolved_file = resolved_parent / p.name
+                key = resolved_file.relative_to(resolved_dlc).as_posix()
                 if not key:
                     continue
-                current[key] = p.stat().st_size
+                if resolve_file:
+                    info = p.stat()
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                current[key] = info.st_size
             except (OSError, ValueError):
                 continue
-        # A setting change or retargeted root junction during the walk must not
-        # publish a partial snapshot of the old library. Returning unavailable
-        # leaves the watcher's baseline/pending entries intact until next tick.
+        for parent_key, (parent, snapshot) in directories.items():
+            if parent_key != root_key and _watch_directory_snapshot(parent) != snapshot:
+                return None
+        # A config/root change must likewise leave the baseline and pending
+        # entries intact until the next scan. This is a path-based check, like
+        # the prior resolve/stat scan, not an atomic filesystem snapshot.
         selected_dlc = _get_dlc_dir() if _get_dlc_dir else None
-        if not selected_dlc or selected_dlc.resolve() != resolved_dlc:
+        if not selected_dlc or _watch_directory_snapshot(selected_dlc) != root_snapshot:
+            return None
+        if str(selected_dlc) != root_key and _watch_directory_snapshot(dlc) != root_snapshot:
             return None
     except OSError:
         return None
