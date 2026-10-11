@@ -7937,6 +7937,7 @@ def _resync_stale_song_seed(song_key: str, path: Path) -> list[str]:
 # from cloud_loader on purpose — it reacts to the file appearing on
 # disk, not to any specific code path that produced it.
 _WATCH_INTERVAL_SEC = 5
+_WATCH_RECONCILE_SEC = 60
 _watcher_thread: threading.Thread | None = None
 _watcher_stop = threading.Event()
 _watcher_sizes: dict[str, int] = {}     # filename -> size at last tick
@@ -8051,11 +8052,153 @@ def _watch_scan_dlc() -> dict[str, int] | None:
     return current
 
 
-def _watch_tick() -> list[str]:
+class _WindowsDirectoryNotification:
+    """One watcher-owned, nonblocking change handle on a local fixed volume."""
+
+    @classmethod
+    def open(cls, root):
+        if os.name != "nt":
+            return None
+        # Keep Windows imports and DLL loading out of other platforms/startup.
+        import ctypes
+        from ctypes import wintypes
+
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        signatures = {
+            "GetVolumePathNameW": ([wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD], wintypes.BOOL),
+            "GetDriveTypeW": ([wintypes.LPCWSTR], wintypes.UINT),
+            "FindFirstChangeNotificationW": ([wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            "WaitForSingleObject": ([wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
+            "FindNextChangeNotification": ([wintypes.HANDLE], wintypes.BOOL),
+            "FindCloseChangeNotification": ([wintypes.HANDLE], wintypes.BOOL),
+        }
+        for name, (args, result) in signatures.items():
+            function = getattr(api, name)
+            function.argtypes = args
+            function.restype = result
+        volume = ctypes.create_unicode_buffer(32768)
+        if not api.GetVolumePathNameW(str(root), volume, len(volume)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # Query the actual mount point, not drive-letter spelling: mapped
+        # network/removable/unknown volumes must retain the five-second poll.
+        if not volume.value or api.GetDriveTypeW(volume.value) != 3:  # DRIVE_FIXED
+            return None
+        # Names, attributes, size, last-write and security; not last-access.
+        notify_filter = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x100
+        handle = api.FindFirstChangeNotificationW(str(root), True, notify_filter)
+        if handle is None or handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        notification = cls()
+        notification._api = api
+        notification._handle = handle
+        notification._error = lambda: ctypes.WinError(ctypes.get_last_error())
+        return notification
+
+    def changed(self):
+        state = self._api.WaitForSingleObject(self._handle, 0)
+        if state == 258:  # WAIT_TIMEOUT: leave the existing request armed.
+            return False
+        if state != 0:  # Only WAIT_OBJECT_0 permits FindNext.
+            raise self._error()
+        # Rearm BEFORE scanning, so changes during that scan remain signaled.
+        if not self._api.FindNextChangeNotification(self._handle):
+            raise self._error()
+        return True
+
+    def close(self):
+        handle, self._handle = self._handle, None
+        if handle is not None and not self._api.FindCloseChangeNotification(handle):
+            raise self._error()
+
+
+class _WatchScanGate:
+    """Skip unchanged ticks; notifications never replace the canonical scan."""
+
+    def __init__(self, scan, get_root, snapshot, pending,
+                 open_notification=_WindowsDirectoryNotification.open,
+                 clock=time.monotonic):
+        self._scan = scan
+        self._get_root = get_root
+        self._snapshot = snapshot
+        self._pending = pending
+        self._open_notification = open_notification
+        self._clock = clock
+        self._identity = None
+        self._notification = None
+        self._last_scan = None
+        self._retry = True
+
+    def _root_identity(self):
+        root = self._get_root()
+        if root is None:
+            raise OSError("DLC root unavailable")
+        resolved, device, inode = self._snapshot(root)
+        if not device or not inode:
+            raise OSError("DLC root has no stable filesystem identity")
+        # Preserve configured spelling as well as resolved identity.
+        return (str(root), str(resolved), device, inode)
+
+    def close(self):
+        notification, self._notification = self._notification, None
+        if notification is not None:
+            try:
+                notification.close()
+            except Exception:
+                log.warning("rig_builder watcher notification close failed", exc_info=True)
+
+    def scan(self):
+        try:
+            identity = self._root_identity()
+        except Exception:
+            self.close()
+            self._identity = None
+            self._retry = True
+            return self._full_scan()
+        if identity != self._identity:
+            self.close()
+            self._identity = identity
+            self._retry = True
+            try:
+                # Arm before priming/scanning; then prove the configured root
+                # did not change while the native handle was being created.
+                self._notification = self._open_notification(identity[1])
+                if self._root_identity() != identity:
+                    self.close()
+                    self._identity = None
+            except Exception:
+                self.close()
+                # Fall back for this identity; root/config changes retry it.
+                log.debug("rig_builder watcher notifications unavailable", exc_info=True)
+        changed = False
+        if self._notification is not None:
+            try:
+                changed = self._notification.changed()
+            except Exception:
+                self.close()
+                log.debug("rig_builder watcher notification failed; polling", exc_info=True)
+        if (self._notification is None or changed or self._retry or self._pending()
+                or self._last_scan is None
+                or self._clock() - self._last_scan >= _WATCH_RECONCILE_SEC):
+            return self._full_scan()
+        # A skipped scan must not advance/drop the baseline or pending state.
+        return None
+
+    def _full_scan(self):
+        # A consumed notification is not sufficient if the scanner fails or
+        # declines a changing root. Retry on the next tick, even without events.
+        self._retry = True
+        current = self._scan()
+        if current is not None:
+            self._last_scan = self._clock()
+            self._retry = False
+        return current
+
+
+def _watch_tick(scan=None) -> list[str]:
     """Diff the DLC dir against the previous tick and return the list of
     songs that just finished materializing (confirmed stable). Updates
     the baseline as a side effect."""
-    current = _watch_scan_dlc()
+    current = (_watch_scan_dlc if scan is None else scan)()
     if current is None:
         return []
 
@@ -8099,10 +8242,14 @@ def _watch_tick() -> list[str]:
 def _watch_loop():
     log.info("rig_builder watcher started (interval=%ss)", _WATCH_INTERVAL_SEC)
     _watcher_state["running"] = True
+    gate = _WatchScanGate(
+        _watch_scan_dlc, lambda: _get_dlc_dir() if _get_dlc_dir else None,
+        _watch_directory_snapshot, lambda: bool(_watcher_pending),
+    )
     try:
         while not _watcher_stop.is_set():
             try:
-                to_fire = _watch_tick()
+                to_fire = _watch_tick(gate.scan)
             except Exception:
                 log.exception("rig_builder watcher tick failed")
                 _watcher_state["last_error"] = "tick failed (see server log)"
@@ -8124,6 +8271,7 @@ def _watch_loop():
 
             _watcher_stop.wait(_WATCH_INTERVAL_SEC)
     finally:
+        gate.close()
         _watcher_state["running"] = False
 
 
