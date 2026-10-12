@@ -1341,7 +1341,7 @@ def _write_settings_file(data: dict) -> None:
 
 
 def _save_settings(new_settings: dict) -> dict:
-    global _settings, _t3k_client
+    global _settings, _t3k_client, _amp_sims_epoch, _watcher_reprime
     if _config_dir is None:
         raise RuntimeError("config_dir not available")
     with _settings_lock:
@@ -1352,6 +1352,12 @@ def _save_settings(new_settings: dict) -> dict:
     # Reset the cached client so a new key takes effect immediately.
     with _t3k_lock:
         _t3k_client = None
+    with _watcher_condition:
+        if any(current.get(key, True) != merged.get(key, True)
+               for key in ("rig_builder_enabled", "auto_watch")):
+            _amp_sims_epoch += 1
+            _watcher_reprime = True
+        _watcher_condition.notify_all()
     return merged
 
 
@@ -7507,7 +7513,7 @@ def _batch_worker(mode: str = "all", categories=None):
 _auto_lock = threading.Lock()
 
 
-def _auto_download_for_song(filename: str, path: Path) -> dict:
+def _auto_download_for_song(filename: str, path: Path, continue_if=None) -> dict:
     """Parse one song, pick + download tone3000 captures for each gear
     piece, and persist the preset chain. Shared by the
     /auto_download_song endpoint and the materialization watcher.
@@ -7522,6 +7528,12 @@ def _auto_download_for_song(filename: str, path: Path) -> dict:
     """
     global _batch_disk_bytes
     with _auto_lock:
+        counts = {"processed": 0, "downloaded": 0, "rs_ir_used": 0,
+                  "skipped_assigned": 0, "skipped_no_candidate": 0, "failed": 0}
+        def cancelled():
+            return continue_if is not None and not continue_if()
+        if cancelled():
+            return {**counts, "cancelled": True}
         settings = _load_settings()
         rs_map = _load_rs_to_real()
         rs_irs_map = _load_rs_cab_to_ir()
@@ -7544,10 +7556,9 @@ def _auto_download_for_song(filename: str, path: Path) -> dict:
         # the disk counter since we're acting on a single song.
         _batch_disk_bytes = 0
         seen_gears: dict[str, dict] = {}
-        counts = {"processed": 0, "downloaded": 0, "rs_ir_used": 0,
-                  "skipped_assigned": 0, "skipped_no_candidate": 0, "failed": 0}
-
         for raw in raw_tones:
+            if cancelled():
+                return {**counts, "cancelled": True}
             parsed = _parse_tone(raw)
             tone_key = parsed["key"] or parsed["name"]
             preset_name = f"{song_key}::{tone_key}"
@@ -7587,6 +7598,8 @@ def _auto_download_for_song(filename: str, path: Path) -> dict:
                 continue
 
             for piece in parsed["chain"]:
+                if cancelled():
+                    return {**counts, "cancelled": True}
                 rs_type = piece["type"]
                 info = rs_map.get(rs_type) or {}
                 category = info.get("category") or _guess_category_from_slot(piece["slot"])
@@ -7817,6 +7830,8 @@ def _auto_download_for_song(filename: str, path: Path) -> dict:
                 })
                 counts["processed"] += 1
 
+            if cancelled():
+                return {**counts, "cancelled": True}
             _persist_preset_chain(
                 filename=song_key,
                 tone_key=tone_key,
@@ -7940,6 +7955,11 @@ _WATCH_INTERVAL_SEC = 5
 _WATCH_RECONCILE_SEC = 60
 _watcher_thread: threading.Thread | None = None
 _watcher_stop = threading.Event()
+_watcher_condition = threading.Condition()
+_amp_sims_snapshot = {"applicable": False}
+_amp_sims_unsubscribe = None
+_amp_sims_epoch = 0
+_watcher_reprime = False
 _watcher_sizes: dict[str, int] = {}     # filename -> size at last tick
 _watcher_pending: dict[str, int] = {}   # filename -> size awaiting a stable confirmation
 _watcher_state: dict = {
@@ -7950,6 +7970,61 @@ _watcher_state: dict = {
     "last_error": None,
     "interval_sec": _WATCH_INTERVAL_SEC,
 }
+
+
+def _bind_amp_sims_policy(context: dict) -> None:
+    """Cache the Core policy; settings notifications only wake the worker."""
+    global _amp_sims_unsubscribe
+    if _amp_sims_unsubscribe:
+        _amp_sims_unsubscribe()
+        _amp_sims_unsubscribe = None
+    policy = context.get("amp_sims_policy")
+
+    def changed(snapshot):
+        global _amp_sims_snapshot, _amp_sims_epoch, _watcher_reprime
+        with _watcher_condition:
+            _amp_sims_snapshot = dict(snapshot)
+            _amp_sims_epoch += 1
+            if not _tones_allowed():
+                _watcher_reprime = True
+            _watcher_condition.notify_all()
+
+    if not policy:
+        changed({"applicable": False})  # compatibility with older/pure web hosts
+        return
+    try:
+        changed(policy["snapshot"]())
+        _amp_sims_unsubscribe = policy["subscribe"](changed)
+    except Exception:
+        changed({"applicable": True, "ready": False, "enabled": False})
+        log.exception("rig_builder could not subscribe to amp-sims policy")
+
+
+def _tones_allowed() -> bool:
+    snapshot = _amp_sims_snapshot
+    return (not snapshot.get("applicable", False)
+            or (snapshot.get("ready") is True and snapshot.get("enabled") is True))
+
+
+def _tones_denied():
+    if _tones_allowed():
+        return None
+    return JSONResponse({"error": "In-app amp simulations are disabled",
+                         "code": "amp-sims-disabled"}, status_code=409)
+
+
+def _watch_allowed() -> bool:
+    if not _tones_allowed():
+        return False
+    settings = _load_settings()
+    return (settings.get("rig_builder_enabled", True) is not False
+            and settings.get("auto_watch", True) is not False)
+
+
+def _stop_watcher() -> None:
+    with _watcher_condition:
+        _watcher_stop.set()
+        _watcher_condition.notify_all()
 
 
 def _watch_directory_snapshot(path: Path) -> tuple[Path, int, int]:
@@ -8240,14 +8315,40 @@ def _watch_tick(scan=None) -> list[str]:
 
 
 def _watch_loop():
+    global _watcher_reprime
     log.info("rig_builder watcher started (interval=%ss)", _WATCH_INTERVAL_SEC)
     _watcher_state["running"] = True
-    gate = _WatchScanGate(
-        _watch_scan_dlc, lambda: _get_dlc_dir() if _get_dlc_dir else None,
-        _watch_directory_snapshot, lambda: bool(_watcher_pending),
-    )
+    gate = None
     try:
         while not _watcher_stop.is_set():
+            with _watcher_condition:
+                while not _watcher_stop.is_set() and not _watch_allowed():
+                    if gate is not None:
+                        gate.close()
+                        gate = None
+                    # No timer, directory reads, or notification polling while
+                    # disabled. Policy/settings commits wake this condition.
+                    _watcher_condition.wait()
+                if _watcher_stop.is_set():
+                    break
+                # A quick OFF/ON may finish while a scan is in progress. Latch
+                # the boundary so it cannot retain the pre-disable baseline.
+                if _watcher_reprime:
+                    if gate is not None:
+                        gate.close()
+                        gate = None
+                    _watcher_reprime = False
+                generation = _amp_sims_epoch
+            if gate is None:
+                # Resume from a new baseline, never enqueue the disabled
+                # period's library as a backlog of downloads or tone writes.
+                _watcher_sizes.clear()
+                _watcher_pending.clear()
+                _watcher_state["primed"] = False
+                gate = _WatchScanGate(
+                    _watch_scan_dlc, lambda: _get_dlc_dir() if _get_dlc_dir else None,
+                    _watch_directory_snapshot, lambda: bool(_watcher_pending),
+                )
             try:
                 to_fire = _watch_tick(gate.scan)
             except Exception:
@@ -8255,27 +8356,33 @@ def _watch_loop():
                 _watcher_state["last_error"] = "tick failed (see server log)"
                 to_fire = []
 
-            if to_fire:
-                settings = _load_settings()
+            if to_fire and generation == _amp_sims_epoch and _watch_allowed():
                 # Fire on every newly-materialized song. tone3000 is optional:
                 # _watch_fire → _auto_download_for_song assigns VST primaries with
                 # no download and only uses the client for gear lacking a VST,
                 # so a VST-only rig (no token) still gets its chain seeded in the
                 # background. (Previously gated on has_api_access, so users
                 # without a tone3000 key never got background seeding at all.)
-                if settings.get("auto_watch", True):
-                    for name in to_fire:
-                        if _watcher_stop.is_set():
-                            break
-                        _watch_fire(name)
+                for name in to_fire:
+                    if (_watcher_stop.is_set() or generation != _amp_sims_epoch
+                            or not _watch_allowed()):
+                        break
+                    _watch_fire(name)
 
-            _watcher_stop.wait(_WATCH_INTERVAL_SEC)
+            with _watcher_condition:
+                if (_watch_allowed() and generation == _amp_sims_epoch
+                        and not _watcher_stop.is_set()):
+                    _watcher_condition.wait(_WATCH_INTERVAL_SEC)
     finally:
-        gate.close()
+        if gate is not None:
+            gate.close()
         _watcher_state["running"] = False
 
 
 def _watch_fire(name: str) -> None:
+    if not _watch_allowed():
+        return
+    generation = _amp_sims_epoch
     path = _resolve_song_file(name)
     if path is None:
         return
@@ -8285,8 +8392,13 @@ def _watch_fire(name: str) -> None:
     # is materialized — the tone reader reads from there.
     if not _song_data_available(path):
         return
+    if not _watch_allowed() or generation != _amp_sims_epoch:
+        return
     try:
-        result = _auto_download_for_song(song_key, path)
+        result = _auto_download_for_song(song_key, path, continue_if=lambda: (
+            _watch_allowed() and generation == _amp_sims_epoch and not _watcher_stop.is_set()))
+        if result.get("cancelled"):
+            return
         _watcher_state["fired_count"] += 1
         _watcher_state["last_fired"] = {
             "filename": song_key,
@@ -8295,6 +8407,8 @@ def _watch_fire(name: str) -> None:
             "downloaded": result.get("downloaded"),
         }
         log.info("rig_builder watcher auto-downloaded %s: %s", song_key, result)
+        if not _watch_allowed() or generation != _amp_sims_epoch:
+            return
         # Also fix cab assignments right after the download. Materialised
         # songs whose DLC PSARC ships `Cabinet.Type='Cabinets'` get the
         # real cab + correct mic IR baked into preset_pieces here — the
@@ -8540,6 +8654,7 @@ def setup(app, context):
     _get_dlc_dir = context["get_dlc_dir"]
     _get_sloppak_cache_dir = context.get("get_sloppak_cache_dir")
     _db_path = str(_config_dir / "nam_tone.db")
+    _bind_amp_sims_policy(context)
 
     # Generated data (rs_to_real.json, default_captures.json, …) must be
     # writable. The bundled plugin dir is read-only in packaged builds (e.g. an
@@ -8744,6 +8859,8 @@ def setup(app, context):
             },
             "watcher": {
                 "running": _watcher_state["running"],
+                "suspended": not _watch_allowed(),
+                "policy_generation": _amp_sims_snapshot.get("generation"),
                 "primed": _watcher_state["primed"],
                 "fired_count": _watcher_state["fired_count"],
                 "last_fired": _watcher_state["last_fired"],
@@ -9155,6 +9272,9 @@ def setup(app, context):
         engine when no song is active. When nothing is assigned yet the
         chain is just the master wrap; the caller gates on the piece list
         from /default_tone and skips loading in that case."""
+        denied = _tones_denied()
+        if denied is not None:
+            return denied
         pid = _get_default_tone_preset_id()
         if pid is None:
             return JSONResponse({"error": "could not get default tone preset"}, 500)
@@ -10081,6 +10201,9 @@ def setup(app, context):
         Returns counts: `{processed, downloaded, skipped_assigned,
         skipped_no_candidate, failed}`.
         """
+        denied = _tones_denied()
+        if denied is not None:
+            return denied
         filename = data.get("filename")
         if not filename:
             return JSONResponse({"error": "filename required"}, 400)
@@ -10106,7 +10229,9 @@ def setup(app, context):
         # has_api_access is False. (Previously a hard 400 here blocked the whole
         # direct-play auto-seed path whenever no tone3000 key was configured.)
         try:
-            return _auto_download_for_song(_db_song_key(filename, path), path)
+            generation = _amp_sims_epoch
+            return _auto_download_for_song(_db_song_key(filename, path), path,
+                continue_if=lambda: _tones_allowed() and generation == _amp_sims_epoch)
         except ValueError as e:
             return JSONResponse({"error": f"unreadable file: {e}"}, 400)
         except Exception as e:
@@ -10433,6 +10558,9 @@ def setup(app, context):
         operator can see how many NAM stages were built, and the engine's
         `slotsLoaded` (logged client-side) reveals how many it accepted.
         """
+        denied = _tones_denied()
+        if denied is not None:
+            return denied
         conn = _get_conn()
         prow = conn.execute(
             "SELECT id, name, input_gain, output_gain, gate_threshold, "
@@ -10704,6 +10832,9 @@ def setup(app, context):
         the previous tone's slot range + clearing bypass on the new
         tone's slot range — no clearChain, no loadPreset, no transient.
         """
+        denied = _tones_denied()
+        if denied is not None:
+            return denied
         try:
             decoded = urllib.parse.unquote(filename)
         except Exception:

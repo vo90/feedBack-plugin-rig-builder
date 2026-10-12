@@ -15,6 +15,110 @@ window.RB_API = window.RB_API || '/api/plugins/rig_builder';
 
 window.NAM_API = window.NAM_API || '/api/plugins/nam_tone';
 
+// Internal tones are optional. Keep the plugin/editor installed while suspending
+// its automatic work and its own effects calls; capture and backing stay owned
+// by their existing providers. Older hosts without this policy retain behavior.
+const RbAmpPolicy = (() => {
+    const service = window.feedBack && window.feedBack.ampSims;
+    let policy = service && service.version === 1 ? service.snapshot() : { applicable: false };
+    let epoch = 0, hostOwned = false, connected = false, suspension = Promise.resolve();
+    const pending = new Set(), timers = new Set(), hooks = [];
+    const nativeWrites = new Set(['loadPreset', 'loadVST', 'clearChain', 'replaceIR', 'setBypass',
+        'setMultiBypass', 'setParameter', 'setGain', 'setMonitorMute', 'setNoiseGate', 'setBranch',
+        'setBranchSrc', 'setPan', 'setPhase', 'setPostGain', 'startAudio', 'stopAudio', 'openPluginEditor']);
+    const hostWrites = new Set(['loadPlan', 'selectChain', 'activateSegment', 'setRouteGain',
+        'setStageBypass', 'setStageParameter']);
+    const allowed = () => (!policy.applicable || (policy.ready && policy.enabled))
+        && window.__rbEnabled !== false;
+    const current = token => token === epoch && allowed();
+    function disabled() {
+        return Object.assign(new Error('In-app amp simulations are disabled or this tone operation is stale'),
+            { code: 'amp-sims-disabled' });
+    }
+    function check(token = epoch) { if (!current(token)) throw disabled(); }
+    function issue(run, token = epoch, ownership) {
+        if (!current(token)) return Promise.reject(disabled());
+        let operation;
+        try { operation = Promise.resolve(run()).then(value => {
+            // A denied selection never grants ownership of the shared route.
+            if (ownership === 'host' && value && value.outcome === 'handled') hostOwned = true;
+            return value;
+        }); } catch (error) { operation = Promise.reject(error); }
+        pending.add(operation);
+        operation.then(() => pending.delete(operation), () => pending.delete(operation));
+        return operation.then(value => { check(token); return value; });
+    }
+    function audio(raw, host = false) {
+        if (!raw) return raw;
+        const token = epoch, writes = host ? hostWrites : nativeWrites;
+        // An empty proxy target also supports Electron's frozen contextBridge.
+        return new Proxy({}, { get(_target, key) {
+            if (key === '__rbToneEpoch') return token;
+            const value = raw[key];
+            if (typeof value !== 'function') return value;
+            if (!writes.has(key)) return value.bind(raw);
+            return (...args) => issue(() => value.apply(raw, args), token,
+                host && ['loadPlan', 'selectChain'].includes(key) ? 'host'
+                    : !host && ['loadPreset', 'loadVST'].includes(key) ? 'legacy' : null).catch(error => {
+                        if (error.code !== 'amp-sims-disabled' || ['loadPreset', 'loadVST', 'loadPlan'].includes(key)) throw error;
+                        return { outcome: 'denied', success: false, code: error.code };
+                    });
+        }});
+    }
+    function later(fn, delay) {
+        if (!allowed()) return null;
+        const token = epoch;
+        const timer = setTimeout(() => {
+            timers.delete(timer);
+            if (current(token)) fn();
+        }, delay);
+        timers.add(timer);
+        return timer;
+    }
+    function register(hook) { hooks.push(hook); if (connected && allowed() && hook.resume) hook.resume(); }
+    function suspend(clearActiveLegacy = false) {
+        ++epoch; // invalidate before any await, including already-issued loads
+        for (const timer of timers) clearTimeout(timer);
+        timers.clear();
+        for (const hook of hooks) if (hook.stop) hook.stop();
+        suspension = suspension.then(async () => {
+            while (pending.size) await Promise.allSettled([...pending]);
+            let released = false;
+            if (hostOwned) {
+                released = await rbReleaseAudioEffectsRouteWithHost('amp-sims-disabled');
+                hostOwned = false;
+            }
+            // Only the existing Rig-master OFF behavior clears an active
+            // legacy mega-chain. Global OFF is cleared by Desktop after ALL
+            // tone providers drain; idle legacy chains confer no ownership.
+            if (clearActiveLegacy && !released) {
+                const raw = (window.feedBackDesktop || window.slopsmithDesktop || {}).audio;
+                if (raw && typeof raw.clearChain === 'function') await raw.clearChain();
+            }
+        });
+        return suspension;
+    }
+    async function resume() {
+        await suspension;
+        if (allowed()) for (const hook of hooks) if (hook.resume) hook.resume();
+    }
+    function connect() {
+        if (connected) return;
+        connected = true;
+        if (!service || service.version !== 1) { resume(); return; }
+        service.subscribe(next => {
+            const changed = next.generation !== policy.generation || next.enabled !== policy.enabled
+                || next.ready !== policy.ready || next.applicable !== policy.applicable;
+            policy = next;
+            if (!allowed()) return suspend();
+            if (changed) ++epoch;
+            return resume();
+        });
+    }
+    return { allowed, current, check, disabled, issue, audio, later, register, suspend, resume,
+        connect, token: () => epoch };
+})();
+
 // ── Opt-in simulated-rig VST pack: first-run prompt + achievements ──────────
 // DESIGN INTENT (for other contributors): these achievements reward *real
 // musician learning*, not game busywork — the same arc as career's. The VSTs
@@ -289,16 +393,19 @@ function rbSetImmersiveTopbar(on) {
     const origFetch = window.fetch.bind(window);
     const RE = /\/api\/plugins\/nam_tone\/native-preset\/(\d+)(?:[/?#]|$)/;
     window.fetch = function (input, init) {
+        const policyToken = RbAmpPolicy.token();
         let url;
         try { url = typeof input === 'string' ? input : (input && input.url); } catch (_) { url = null; }
         const m = (typeof url === 'string') ? url.match(RE) : null;
-        if (!m || window.__rbChainPlayback === false) {
+        if (!m || window.__rbChainPlayback === false || !RbAmpPolicy.allowed()) {
             return origFetch(input, init);
         }
         const fullUrl = `/api/plugins/rig_builder/native_preset_full/${m[1]}`;
         return origFetch(fullUrl, init).then(async (r) => {
+            RbAmpPolicy.check(policyToken);
             if (!r.ok) return origFetch(input, init);            // build failed → original 2-stage
             const txt = await r.text();
+            RbAmpPolicy.check(policyToken);
             try {
                 const data = JSON.parse(txt);
                 const chain = data && data.native_preset && data.native_preset.chain;
@@ -342,9 +449,9 @@ function rbSetImmersiveTopbar(on) {
                 // entire library sounds "very clean and similar".
                 // Same delay strategy as the VST param re-apply so it
                 // lands after the chain has settled in the engine.
-                setTimeout(() => { rbApplyChainInputDrive({ chain }); }, reapplyDelay);
+                RbAmpPolicy.later(() => { rbApplyChainInputDrive({ chain }); }, reapplyDelay);
 
-                setTimeout(() => {
+                RbAmpPolicy.later(() => {
                     rbStartFinalChainNormalizer(chain);
                 }, reapplyDelay + 150);
 
@@ -352,7 +459,10 @@ function rbSetImmersiveTopbar(on) {
                 return origFetch(input, init);
             }
             return new Response(txt, { status: 200, headers: { 'Content-Type': 'application/json' } });
-        }).catch(() => origFetch(input, init));               // any error → original
+        }).catch(error => {
+            if (error && error.code === 'amp-sims-disabled') throw error;
+            return origFetch(input, init);
+        });
     };
 })();
 
@@ -495,6 +605,8 @@ function rbDriveForChainInput(opts) {
 }
 
 function rbApplyChainInputDrive(opts) {
+    if (!RbAmpPolicy.allowed()) return Promise.resolve();
+    const token = RbAmpPolicy.token();
     // While the node graph is disconnected (Input/Output unwired) the chain is
     // silenced at the source — keep it silent even if a scheduled re-poll fires.
     // The clean calibration trim (rbInputCalibration) rides on top of the
@@ -517,10 +629,11 @@ function rbApplyChainInputDrive(opts) {
     // audition path).
     const calledExplicitly = opts && (opts.isBass === true || opts.isBass === false || Array.isArray(opts.chain));
     if (!calledExplicitly && !(opts && opts._isRepoll)) {
-        setTimeout(() => rbApplyChainInputDrive({ _isRepoll: true }), 1500);
-        setTimeout(() => rbApplyChainInputDrive({ _isRepoll: true }), 3500);
+        RbAmpPolicy.later(() => rbApplyChainInputDrive({ _isRepoll: true }), 1500);
+        RbAmpPolicy.later(() => rbApplyChainInputDrive({ _isRepoll: true }), 3500);
     }
     return rbSetRouteGainsWithHost({ input: drive }, 'chain-input-drive').then((handled) => {
+        if (!RbAmpPolicy.current(token)) return;
         if (handled) return;
         const audio = rbAudioApi();
         if (!audio || typeof audio.setGain !== 'function') return;
@@ -692,11 +805,14 @@ async function rbSetRouteGainsWithHost(gains, reason) {
 }
 
 async function rbApplyChainOutputGain(opts) {
+    if (!RbAmpPolicy.allowed()) return;
+    const token = RbAmpPolicy.token();
     const chain = opts && Array.isArray(opts.chain) ? opts.chain : null;
     if (!chain) return;
     const target = rbClampChainGainTarget(rbChainGainTargetFor(chain));
     window.__rbPendingChainGainTarget = target;
     if (await rbSetRouteGainsWithHost({ chain: target }, 'chain-output-gain')) return;
+    if (!RbAmpPolicy.current(token)) return;
     const audio = rbAudioApi();
     if (!audio || typeof audio.setGain !== 'function') return;
     return audio.setGain('chain', target).catch((e) => {
@@ -760,8 +876,8 @@ function rbDbToGain(db) {
 function rbAudioApi() {
     // feedBackDesktop is the host's current bridge name; slopsmithDesktop is
     // the pre-rename fallback (older hosts; the shim at the top also aliases).
-    return (window.feedBackDesktop && window.feedBackDesktop.audio)
-        || (window.slopsmithDesktop && window.slopsmithDesktop.audio) || null;
+    return RbAmpPolicy.audio((window.feedBackDesktop && window.feedBackDesktop.audio)
+        || (window.slopsmithDesktop && window.slopsmithDesktop.audio) || null);
 }
 
 function rbGainToDb(gain) {
@@ -873,6 +989,8 @@ function rbStopFinalChainNormalizer() {
 
 async function rbStartFinalChainNormalizer(chainSpec, opts) {
     rbStopFinalChainNormalizer();
+    if (!RbAmpPolicy.allowed()) return;
+    const token = RbAmpPolicy.token();
 
     const chain = Array.isArray(chainSpec) ? chainSpec : [];
     const audio = rbAudioApi();
@@ -898,6 +1016,7 @@ async function rbStartFinalChainNormalizer(chainSpec, opts) {
     }
 
     const settings = await rbLoadFinalNormSettings();
+    if (!RbAmpPolicy.current(token)) return;
 
     // Bootstrap with the existing smart target. This preserves all the old
     // safety logic and gives the normalizer a sane starting point.
@@ -917,6 +1036,7 @@ async function rbStartFinalChainNormalizer(chainSpec, opts) {
     if (!settings.enabled) return;
 
     const firstMeter = await rbReadFinalOutputMeter(audio);
+    if (!RbAmpPolicy.current(token)) return;
 
     // No meter API = cannot do real final loudness normalization.
     // Keep old behaviour instead of breaking playback.
@@ -941,6 +1061,7 @@ async function rbStartFinalChainNormalizer(chainSpec, opts) {
         if (runId !== _rbFinalNormRunId) return;
 
         const meter = await rbReadFinalOutputMeter(audio);
+        if (runId !== _rbFinalNormRunId || !RbAmpPolicy.current(token)) return;
         if (!meter) return;
 
         const rmsDb = meter.rmsDb;
@@ -1210,6 +1331,8 @@ async function rbSignalChainLoaded() {
     if (_rbUnmuteRun) { const f = _rbUnmuteRun; await f(); }
 }
 async function rbPreLoadMute(chainLen, targetGain, opts) {
+    if (!RbAmpPolicy.allowed()) return;
+    const policyToken = RbAmpPolicy.token();
     if (window.__rbMutePreLoad === false) return;
     const deferUnmute = !!(opts && opts.deferUnmute);
     const pendingTarget = rbClampChainGainTarget(targetGain);
@@ -1235,7 +1358,7 @@ async function rbPreLoadMute(chainLen, targetGain, opts) {
         // (flag/event-driven, as intended) the moment the load truly finishes.
         if (deferUnmute && _rbUnmuteRun && _rbUnmuteTimer) {
             clearTimeout(_rbUnmuteTimer);
-            _rbUnmuteTimer = setTimeout(_rbUnmuteRun, 15000);
+            _rbUnmuteTimer = RbAmpPolicy.later(_rbUnmuteRun, 15000);
             _rbUnmuteDeadline = Date.now() + 15000;
         } else if (_rbUnmuteRun && _rbUnmuteTimer
                    && Date.now() + hold > _rbUnmuteDeadline) {
@@ -1245,7 +1368,7 @@ async function rbPreLoadMute(chainLen, targetGain, opts) {
             // would otherwise fire mid-load and let the load peaks through.
             // Only ever lengthen (a defer caller's 15 s net is never cut short).
             clearTimeout(_rbUnmuteTimer);
-            _rbUnmuteTimer = setTimeout(_rbUnmuteRun, hold);
+            _rbUnmuteTimer = RbAmpPolicy.later(_rbUnmuteRun, hold);
             _rbUnmuteDeadline = Date.now() + hold;
         }
         return;                            // coalesce rapid tone changes
@@ -1281,6 +1404,7 @@ async function rbPreLoadMute(chainLen, targetGain, opts) {
     // The actual un-mute. Runs ONCE — whichever fires first wins: the explicit
     // rbSignalChainLoaded() (load really finished) or the safety-fallback timer.
     const doUnmute = async () => {
+        if (!RbAmpPolicy.current(policyToken)) return;
         if (_rbUnmuteRun !== doUnmute) return;     // already ran / superseded
         _rbUnmuteRun = null;
         if (_rbUnmuteTimer) { clearTimeout(_rbUnmuteTimer); _rbUnmuteTimer = null; }
@@ -1305,8 +1429,9 @@ async function rbPreLoadMute(chainLen, targetGain, opts) {
         } catch (_) {}
         _rbMuteInFlight = false;
     };
+    if (!RbAmpPolicy.current(policyToken)) return;
     _rbUnmuteRun = doUnmute;
-    _rbUnmuteTimer = setTimeout(doUnmute, fallbackMs);
+    _rbUnmuteTimer = RbAmpPolicy.later(doUnmute, fallbackMs);
     _rbUnmuteDeadline = Date.now() + fallbackMs;
 }
 
@@ -1378,6 +1503,8 @@ async function rbPreLoadMute(chainLen, targetGain, opts) {
     }
 
     async function autoApplyChain() {
+        if (!RbAmpPolicy.allowed()) return;
+        const policyToken = RbAmpPolicy.token();
         if (window.__rbEnabled === false) return;   // Rig Builder master switch off
         if (window.__rbAmpAutoApply === false) return;
         // Tone override: load the chosen user tone instead of the song's tone
@@ -1408,6 +1535,7 @@ async function rbPreLoadMute(chainLen, targetGain, opts) {
             const r = await rbFetchLegacyNamToneMappings(filename);
             if (!r.ok) return;
             const mappings = await r.json();
+            if (!RbAmpPolicy.current(policyToken)) return;
             const tone = resolveActiveTone();
             const mapping = findMappingForTone(mappings, tone);
             if (!mapping) return;
@@ -1418,6 +1546,7 @@ async function rbPreLoadMute(chainLen, targetGain, opts) {
             const fr = await fetch(`/api/plugins/rig_builder/native_preset_full/${presetId}`);
             if (!fr.ok) return;
             const full = await fr.json();
+            if (!RbAmpPolicy.current(policyToken)) return;
             const chain = full && full.native_preset && full.native_preset.chain;
             if (!Array.isArray(chain) || chain.length === 0) return;
 
@@ -1425,6 +1554,7 @@ async function rbPreLoadMute(chainLen, targetGain, opts) {
             // Goes through our patched loadPreset (mute + chain-gain 0)
             // so the AMP-on transient is suppressed just like a tone change.
             await api.loadPreset(JSON.stringify(full.native_preset));
+            if (!RbAmpPolicy.current(policyToken)) return;
             try { rbApplyToneGate(full.gate, {}); } catch (_) {}
             await rbReapplyVstParamsToChain(api, chain).catch((e) =>
                 console.warn('[rig_builder] AMP auto-apply re-apply VST params:', e));
@@ -1443,14 +1573,18 @@ async function rbPreLoadMute(chainLen, targetGain, opts) {
             // OFF → ON edge. Wait for the bundle's own _namBuildGraph to
             // finish its load (it's ~600-900 ms with a multi-NAM chain on
             // an M1); ours runs after, so we land last and master wins.
-            setTimeout(autoApplyChain, 1200);
+            RbAmpPolicy.later(autoApplyChain, 1200);
         }
         lastEnabled = enabled;
     }
 
     // Poll every 500 ms — the AMP button is injected by the bundle when
     // a song loads, so it may not exist at page-init time.
-    setInterval(checkAmp, 500);
+    let ampPoll = null;
+    RbAmpPolicy.register({
+        stop() { if (ampPoll) clearInterval(ampPoll); ampPoll = null; lastEnabled = false; },
+        resume() { if (!ampPoll) ampPoll = setInterval(checkAmp, 500); },
+    });
 })();
 
 // ── Shared state ────────────────────────────────────────────────────
@@ -1499,7 +1633,7 @@ const RB_PLAYBACK_OBSERVER_ID = 'rig_builder.playback-observer';
 function rbSlopsmith() { return window.slopsmith || null; }
 function rbCapabilitiesApi() { const s = rbSlopsmith(); return s && s.capabilities; }
 function rbCandidateDomainsApi() { const s = rbSlopsmith(); return s && s.candidateDomains; }
-function rbAudioEffectsApi() { const s = rbSlopsmith(); return s && s.audioEffects; }
+function rbAudioEffectsApi() { const s = rbSlopsmith(); return RbAmpPolicy.audio(s && s.audioEffects, true); }
 function rbJobsApi() { const s = rbSlopsmith(); return s && s.jobs; }
 function rbPlaybackApi() {
     const s = rbSlopsmith();
@@ -1761,7 +1895,7 @@ async function rbFetchAudioEffectsPayloadForRequest(request) {
 function rbHandledAudioEffectsResult(result, fallbackReason) {
     if (!result || result.outcome !== 'handled') {
         const reason = result && result.reason ? result.reason : fallbackReason;
-        throw new Error(reason || 'audio-effects chain load failed');
+        throw Object.assign(new Error(reason || 'audio-effects chain load failed'), { code: result && result.code });
     }
     const payload = result.payload || {};
     return { success: true, slotsLoaded: payload.slotsLoaded, audioEffects: result };
@@ -1814,6 +1948,7 @@ async function rbReleaseAudioEffectsRouteWithHost(reason) {
     try {
         const result = await audioEffects.releaseRoute({
             routeKey: RB_EFFECTS_ROUTE_KEY,
+            providerId: RB_EFFECTS_PARTICIPANT_ID,
             authorization: 'playback-session',
             summary: { reason: reason || 'rig-builder-teardown' },
         });
@@ -1846,7 +1981,10 @@ async function rbActivateSegmentWithHost(segmentId, toneKey) {
 }
 
 async function rbLoadNativePresetPayload(api, payload, options) {
+    const token = api && api.__rbToneEpoch != null ? api.__rbToneEpoch : RbAmpPolicy.token();
+    RbAmpPolicy.check(token);
     const ready = await rbEnsureNativeAudioReady(api, options);
+    RbAmpPolicy.check(token);
     if (!ready.ok) throw new Error(ready.reason || 'Native audio input is not ready');
 
     // Push this tone's per-tone noise gate to the engine as the tone loads, so
@@ -1858,15 +1996,19 @@ async function rbLoadNativePresetPayload(api, payload, options) {
     let audioEffectsError = null;
     try {
         const result = await rbLoadChainPlanWithHost(payload, options);
+        RbAmpPolicy.check(token);
         if (result) return { result, viaAudioEffects: true };
     } catch (e) {
+        if (e && e.code === 'amp-sims-disabled') throw e;
         audioEffectsError = e;
         console.warn('[rig_builder] audio-effects executor load failed; using legacy loadPreset:', e);
     }
     const chain = payload && payload.native_preset && Array.isArray(payload.native_preset.chain) ? payload.native_preset.chain : [];
+    RbAmpPolicy.check(token);
     await rbPreLoadMute(chain.length, rbChainGainTargetFor(chain)).catch(() => {});
     if (api.clearChain) await api.clearChain().catch(() => {});
     const result = await api.loadPreset(JSON.stringify(payload.native_preset));
+    RbAmpPolicy.check(token);
     if (!result || result.success === false) {
         throw new Error((result && result.error) || (audioEffectsError && audioEffectsError.message) || 'loadPreset failed');
     }
@@ -1918,6 +2060,7 @@ function rbAudioEffectsOperationHandlers() {
 }
 
 function rbSelectAudioEffectsRoute(reason) {
+    if (!RbAmpPolicy.allowed()) return null;
     rbRegisterAudioEffectsCapability();
     const audioEffects = rbAudioEffectsApi();
     if (!audioEffects || typeof audioEffects.selectChain !== 'function') return null;
@@ -2195,6 +2338,7 @@ async function rbFetchLegacyNamToneMappings(filename) {
 }
 
 async function rbSyncAudioEffectsCapability(reason, options) {
+    if (!RbAmpPolicy.allowed()) return;
     try {
         rbRegisterAudioEffectsCapability();
         const candidates = rbCandidateDomainsApi();
@@ -2550,6 +2694,7 @@ const RbMegaChain = (function () {
     let _indexToSlotId = [];   // chain index → engine slotId
 
     function _settingOn() {
+        if (!RbAmpPolicy.allowed()) return false;
         // Master Rig Builder switch (Gear → "Rig Builder: ON/OFF"). When the
         // user turns Rig Builder OFF, nothing from it loads into the shared
         // engine — their own Audio-menu chain is left untouched.
@@ -2596,6 +2741,7 @@ const RbMegaChain = (function () {
     }
 
     function markPending(filename) {
+        if (!RbAmpPolicy.allowed()) return;
         _pending = true;
         _pendingFilename = filename || _currentSongFilename() || null;
         _lastError = null;
@@ -2627,7 +2773,7 @@ const RbMegaChain = (function () {
     }
 
     function _api() {
-        const a = window.feedBackDesktop && window.feedBackDesktop.audio;
+        const a = rbAudioApi();
         return (a && typeof a.loadPreset === 'function') ? a : null;
     }
 
@@ -2828,6 +2974,8 @@ const RbMegaChain = (function () {
     // window.__rbMuteBypassFlip === false. Restores to the pre-flip state (a user
     // mute always wins). No reload happens — this only hides the switch transient.
     async function _bypassFlipMuted(applyFn) {
+        const policyToken = RbAmpPolicy.token();
+        if (!RbAmpPolicy.current(policyToken)) return;
         const audio = _api();
         if (!audio || window.__rbMuteBypassFlip === false || _rbMuteInFlight
             || typeof audio.setMonitorMute !== 'function') {
@@ -2836,10 +2984,11 @@ const RbMegaChain = (function () {
         let wasMuted = false;
         try { if (typeof audio.isMonitorMuted === 'function') wasMuted = !!(await audio.isMonitorMuted()); } catch (_) {}
         try { await audio.setMonitorMute(true); } catch (_) {}
+        if (!RbAmpPolicy.current(policyToken)) return;
         try {
             return await applyFn();
         } finally {
-            setTimeout(() => {
+            if (RbAmpPolicy.current(policyToken)) RbAmpPolicy.later(() => {
                 if (_rbMuteInFlight) return;   // a real load-mute took over — leave it to that
                 try { audio.setMonitorMute(wasMuted || !!rbState._userMuted); } catch (_) {}
             }, 45);
@@ -2847,6 +2996,8 @@ const RbMegaChain = (function () {
     }
 
     async function _applyActiveTone(activeToneKey) {
+        if (!RbAmpPolicy.allowed()) return;
+        const policyToken = RbAmpPolicy.token();
         const api = _api();
         if (!api || !_mega) return;
         const tone = _findToneByKey(activeToneKey);
@@ -2880,6 +3031,7 @@ const RbMegaChain = (function () {
         const activatedByHost = _loadedViaAudioEffects
             ? await rbActivateSegmentWithHost(segmentId, tone && tone.tone_key || activeToneKey || '')
             : false;
+        if (!RbAmpPolicy.current(policyToken)) return;
         if (!activatedByHost) {
             const changes = [];
             const mapLen = _indexToSlotId.length;
@@ -2904,6 +3056,7 @@ const RbMegaChain = (function () {
                 }
             });
         }
+        if (!RbAmpPolicy.current(policyToken)) return;
         const effectiveChain = chainSpec.map((stage, idx) => {
             const copy = Object.assign({}, stage, { bypassed: !!bypassByIdx[idx] });
             const activeEntry = activeToneSlotByIdx.get(idx);
@@ -2916,13 +3069,18 @@ const RbMegaChain = (function () {
             return copy;
         });
         await rbApplyChainInputDrive({ chain: effectiveChain });
+        if (!RbAmpPolicy.current(policyToken)) return;
         await rbStartFinalChainNormalizer(effectiveChain);
+        if (!RbAmpPolicy.current(policyToken)) return;
         try { await _pokeLevelerRelock(); } catch (_) {}
+        if (!RbAmpPolicy.current(policyToken)) return;
         _activeToneKey = activeToneKey;
         _emitState();
     }
 
     async function buildForSong(filename) {
+        const policyToken = RbAmpPolicy.token();
+        if (!RbAmpPolicy.allowed()) return false;
         // Master Rig Builder switch off → build nothing at all. Checked BEFORE
         // the tone-override guard below, which would otherwise still load a
         // forced tone into the engine while Rig Builder is meant to be off.
@@ -2962,6 +3120,7 @@ const RbMegaChain = (function () {
             const _API_WAIT_DELAYS = [200, 400, 800, 1500, 2500];   // ~5.4 s total
             for (let i = 0; i < _API_WAIT_DELAYS.length && !api; i++) {
                 await new Promise(r => setTimeout(r, _API_WAIT_DELAYS[i]));
+                if (!RbAmpPolicy.current(policyToken)) return false;
                 api = _api();
             }
         }
@@ -2977,6 +3136,7 @@ const RbMegaChain = (function () {
         }
         // Tear down any previous session before starting a fresh one.
         await teardown(true);   // silent — no stem restore on chained calls
+        if (!RbAmpPolicy.current(policyToken)) return false;
         markPending(filename);
 
         // Generation guard: if another song loads while we're waiting on the
@@ -3011,7 +3171,7 @@ const RbMegaChain = (function () {
             _markFailed(filename, e && e.message ? e.message : 'Could not fetch this song\'s tone chain');
             return false;
         }
-        if (myGen !== _buildGen) {
+        if (myGen !== _buildGen || !RbAmpPolicy.current(policyToken)) {
             console.log('[rig_builder mega-chain] build superseded by a newer song load — abandoning');
             return false;
         }
@@ -3031,7 +3191,7 @@ const RbMegaChain = (function () {
                     console.warn('[rig_builder mega-chain] on-demand seed failed:', e);
                 }
             }
-            if (myGen !== _buildGen) {
+            if (myGen !== _buildGen || !RbAmpPolicy.current(policyToken)) {
                 console.log('[rig_builder mega-chain] build superseded during seed — abandoning');
                 return false;
             }
@@ -3042,7 +3202,7 @@ const RbMegaChain = (function () {
                 if (_POST_SEED_DELAYS[attempt]) {
                     await new Promise(r => setTimeout(r, _POST_SEED_DELAYS[attempt]));
                 }
-                if (myGen !== _buildGen) {
+                if (myGen !== _buildGen || !RbAmpPolicy.current(policyToken)) {
                     console.log('[rig_builder mega-chain] build superseded during re-fetch — abandoning');
                     return false;
                 }
@@ -3064,6 +3224,7 @@ const RbMegaChain = (function () {
             _markFailed(filename, `Rig Builder song chain unavailable: HTTP ${resp.status}`);
             return false;
         }
+        if (!RbAmpPolicy.current(policyToken) || myGen !== _buildGen) return false;
         if (!mega) {
             // Still no mappings after the awaited seed → fall back to the
             // cooperative path (the bundle still plays). Run Batch all or open
@@ -3097,7 +3258,7 @@ const RbMegaChain = (function () {
             const _POST_SEED_DELAYS = [0, 800, 2000];
             for (let attempt = 0; attempt < _POST_SEED_DELAYS.length; attempt++) {
                 if (_POST_SEED_DELAYS[attempt]) await new Promise(r => setTimeout(r, _POST_SEED_DELAYS[attempt]));
-                if (myGen !== _buildGen) {
+                if (myGen !== _buildGen || !RbAmpPolicy.current(policyToken)) {
                     console.log('[rig_builder mega-chain] build superseded during default-fallback re-fetch — abandoning');
                     return false;
                 }
@@ -3106,6 +3267,7 @@ const RbMegaChain = (function () {
                 catch (e) { break; }   // network hiccup — keep the default we already have
                 if (!r2.ok) break;     // 404/error — keep the default
                 const m2 = await r2.json();
+                if (!RbAmpPolicy.current(policyToken) || myGen !== _buildGen) return false;
                 if (m2 && !m2.default_fallback
                     && m2.native_preset && Array.isArray(m2.native_preset.chain) && m2.native_preset.chain.length) {
                     mega = m2;         // got the REAL mapped tone on this first entry
@@ -3122,6 +3284,7 @@ const RbMegaChain = (function () {
             _markFailed(filename, 'Rig Builder returned an empty tone chain for this song');
             return false;
         }
+        if (!RbAmpPolicy.current(policyToken) || myGen !== _buildGen) return false;
         _mega = mega;
         // Backend served the default tone because this song has no per-song
         // mapping (every feedpak song). The player button labels it accordingly.
@@ -3148,6 +3311,7 @@ const RbMegaChain = (function () {
                 authorization: 'playback-session',
                 executorOptions: rbAudioEffectsLoadOptionsForChain(mega.native_preset.chain, { startAudio: true }),
             });
+            if (!RbAmpPolicy.current(policyToken) || myGen !== _buildGen) return false;
             loadedViaAudioEffects = !!loaded.viaAudioEffects;
             _loadedViaAudioEffects = loadedViaAudioEffects;   // module flag for _applyActiveTone
             const res = loaded.result;
@@ -3179,6 +3343,7 @@ const RbMegaChain = (function () {
             try {
                 if (typeof api.getChainState === 'function') {
                     const loaded = await api.getChainState();
+                    if (!RbAmpPolicy.current(policyToken) || myGen !== _buildGen) return false;
                     if (Array.isArray(loaded)) {
                         const expected = mega.native_preset.chain.length;
                         const relevant = loaded.length > expected ? loaded.slice(loaded.length - expected) : loaded;
@@ -3213,6 +3378,7 @@ const RbMegaChain = (function () {
             await rbReapplyVstParamsToChain(api, mega.native_preset.chain).catch((e) =>
                 console.warn('[rig_builder mega-chain] re-apply VST params:', e));
         } catch (e) {
+            if (!RbAmpPolicy.current(policyToken) || myGen !== _buildGen) return false;
             console.warn('[rig_builder mega-chain] loadPreset failed, falling back:', e);
             _mega = null;
             _restoreGuitarStem();
@@ -3231,6 +3397,7 @@ const RbMegaChain = (function () {
         // real tone within 100-700 ms once the highway publishes it,
         // and applies it then. Brief silence is a better failure mode
         // than playing the wrong tone confidently.
+        if (!RbAmpPolicy.current(policyToken) || myGen !== _buildGen) return false;
         const initialKey = _resolveActiveToneKey();
         // Single-tone song: there's nothing to resolve from the highway — apply
         // that one tone NOW so the un-mute below fires with the REAL tone active
@@ -3240,6 +3407,7 @@ const RbMegaChain = (function () {
             ? mega.tones[0]
             : (initialKey ? _findToneByKey(initialKey) : null);
         await _applyActiveTone(initialTone ? initialTone.tone_key : null);
+        if (!RbAmpPolicy.current(policyToken) || myGen !== _buildGen) return false;
         // The chain is fully loaded, VST params re-applied, and the active tone's
         // bypass is set — un-mute ONLY if a REAL tone is active. If the highway
         // wasn't ready (initialTone null → everything bypassed), STAY muted; the
@@ -3268,6 +3436,7 @@ const RbMegaChain = (function () {
         // 6. Start watching highway for tone changes AND the bundle's
         // AMP button (we have to turn it back off if anything in the
         // bundle re-prends it, or it will tear down our mega-chain).
+        if (!RbAmpPolicy.current(policyToken) || myGen !== _buildGen) return false;
         _startPolling();
         _startAmpGuard();
 
@@ -3308,7 +3477,7 @@ const RbMegaChain = (function () {
             6500, 7500, 8500, 9500,
         ];
         recheckSchedule.forEach((delay, i) => {
-            setTimeout(() => {
+            RbAmpPolicy.later(() => {
                 if (!_active || !_mega) return;
                 if (_manualToneKey) return;   // hotkey pinned a tone
                 // First 4 rechecks: strict mode. After 700 ms, accept
@@ -3392,7 +3561,7 @@ const RbMegaChain = (function () {
         // (rare) will have published *something* by 1.5 s — even an
         // empty toneChanges array gets populated as soon as the parser
         // runs.
-        setTimeout(() => {
+        RbAmpPolicy.later(() => {
             if (!_active || !_mega) return;
             if (_activeToneKey) return;     // a recheck already landed
             if (_highwayHasAnyToneData()) return;  // schedule en route
@@ -3419,7 +3588,7 @@ const RbMegaChain = (function () {
         // can extract is whether the tone_key looks bass-flavored.
         // Matches the strings nam_tone names bass tones with: "_bass",
         // "Bass_", or the gear referenced is in the Bass_* family.
-        setTimeout(() => {
+        RbAmpPolicy.later(() => {
             if (!_active || !_mega) return;
             if (_activeToneKey) return;     // any recheck already landed
             // One more shot at the relaxed resolver before guessing —
@@ -3449,6 +3618,7 @@ const RbMegaChain = (function () {
             }).catch(() => {});
         }, 10000);
 
+        if (!RbAmpPolicy.current(policyToken) || myGen !== _buildGen) return false;
         _active = true;
         _activeFilename = filename;
         _clearPending(filename);
@@ -3466,6 +3636,7 @@ const RbMegaChain = (function () {
     let _ampRecoveryTimer = null;
     function _startAmpGuard() {
         _stopAmpGuard();
+        if (!RbAmpPolicy.allowed()) return;
         _ampGuardHandle = setInterval(() => {
             if (!_active) return;
             const btn = document.getElementById('btn-nam');
@@ -3479,7 +3650,7 @@ const RbMegaChain = (function () {
                 const filename = window.slopsmith && window.slopsmith.currentSong
                     && window.slopsmith.currentSong.filename;
                 if (filename && !_ampRecoveryTimer) {
-                    _ampRecoveryTimer = setTimeout(() => {
+                    _ampRecoveryTimer = RbAmpPolicy.later(() => {
                         _ampRecoveryTimer = null;
                         buildForSong(filename).catch(e =>
                             console.warn('[rig_builder mega-chain] re-build after AMP-off failed:', e));
@@ -3507,6 +3678,7 @@ const RbMegaChain = (function () {
 
     function _startPolling() {
         _stopPolling();
+        if (!RbAmpPolicy.allowed()) return;
         let lastHwKey = null;   // raw highway key last seen — fast steady-state early-out
         _pollHandle = setInterval(async () => {
             if (!_active || !_mega) return;
@@ -3539,6 +3711,7 @@ const RbMegaChain = (function () {
     }
 
     async function teardown(silent) {
+        ++_buildGen;
         rbStopFinalChainNormalizer();
         _stopPolling();
         _stopAmpGuard();
@@ -3571,6 +3744,22 @@ const RbMegaChain = (function () {
         _indexToSlotId = [];
         _emitState();
     }
+
+    // Synchronous state cancellation, followed by RbAmpPolicy's native drain
+    // and ownership release. Do not change capture/backing or restore gains.
+    function suspendForPolicy() {
+        ++_buildGen;
+        rbStopFinalChainNormalizer();
+        _stopPolling();
+        _stopAmpGuard();
+        _restoreGuitarStem();
+        _active = false; _pending = false; _mega = null;
+        _activeFilename = _pendingFilename = _activeToneKey = _manualToneKey = null;
+        _indexToSlotId = [];
+        _lastError = null;
+        _emitState();
+    }
+    RbAmpPolicy.register({ stop: suspendForPolicy });
 
     function isActive() { return _active; }
     function isPending() { return _pending; }
@@ -3804,6 +3993,7 @@ window.addEventListener('rig-builder:tones-state', () => rbInjectPlayerToneButto
         // first song/idle load respects it (default ON when the key is absent).
         if (s && typeof s.rig_builder_enabled !== 'undefined') {
             window.__rbEnabled = !!s.rig_builder_enabled;
+            if (!window.__rbEnabled) RbAmpPolicy.suspend().catch(() => {});
         }
         if (s && typeof s.mega_chain_mode !== 'undefined') {
             window.__rbMegaChainSetting = !!s.mega_chain_mode;
@@ -3845,6 +4035,7 @@ window.addEventListener('rig-builder:tones-state', () => rbInjectPlayerToneButto
     let _buildingFile = null;
 
     function triggerBuild(filename, source) {
+        if (!RbAmpPolicy.allowed()) return;
         // Master Rig Builder switch off → do nothing at all (no mega-chain, no
         // tone override) so the engine chain stays whatever the user built.
         if (window.__rbEnabled === false) return;
@@ -3895,7 +4086,7 @@ window.addEventListener('rig-builder:tones-state', () => rbInjectPlayerToneButto
         // Give the bundle ~600 ms to inject its #btn-nam etc. so our
         // AMP-off click hits a real button. Also lets the highway
         // stabilise so resolveActiveToneKey reads a sensible value.
-        _pendingBuildTimer = setTimeout(() => {
+        _pendingBuildTimer = RbAmpPolicy.later(() => {
             _pendingBuildTimer = null;
             if (_pendingBuildFile !== filename) return;
             _buildingFile = filename;
@@ -3951,7 +4142,7 @@ window.addEventListener('rig-builder:tones-state', () => rbInjectPlayerToneButto
                 window.__rbPlaybackSettingsFilename = '';
                     if (RbMegaChain.isActive() || RbMegaChain.isPending()) RbMegaChain.teardown(false).catch(() => {});
                 // Back to the idle default tone (if enabled + configured).
-                setTimeout(() => rbReloadDefaultTone().catch(() => {}), 250);
+                RbAmpPolicy.later(() => rbReloadDefaultTone().catch(() => {}), 250);
             });
             window.slopsmith.on('playback:ended', () => {
                 _lastSeenFile = null;
@@ -3963,7 +4154,7 @@ window.addEventListener('rig-builder:tones-state', () => rbInjectPlayerToneButto
                 window.__rbPlaybackSettingsFilename = '';
                     if (RbMegaChain.isActive() || RbMegaChain.isPending()) RbMegaChain.teardown(false).catch(() => {});
                 // Back to the idle default tone (if enabled + configured).
-                setTimeout(() => rbReloadDefaultTone().catch(() => {}), 250);
+                RbAmpPolicy.later(() => rbReloadDefaultTone().catch(() => {}), 250);
             });
         }
         installPlaybackLifecycle();
@@ -3996,7 +4187,7 @@ window.addEventListener('rig-builder:tones-state', () => rbInjectPlayerToneButto
         // Belt-and-suspenders: poll every 2 s for currentSong changes the
         // event might miss (or fire while the setting was off and was then
         // flipped on mid-song).
-        setInterval(() => {
+        const pollCurrentSong = () => {
             if (!RbMegaChain.settingOn()) return;
             if (RbMegaChain.isActive()) return;
             if (_pollSuppressedUntilPlay) return;   // idle default tone is the intended state after a stop
@@ -4004,7 +4195,22 @@ window.addEventListener('rig-builder:tones-state', () => rbInjectPlayerToneButto
             const f = c && c.filename;
             if (!f || f === _lastSeenFile) return;
             triggerBuild(f, 'currentSong poll');
-        }, 2000);
+        };
+        let currentSongPoll = null;
+        RbAmpPolicy.register({
+            stop() {
+                if (currentSongPoll) clearInterval(currentSongPoll);
+                currentSongPoll = null;
+                if (_pendingBuildTimer) clearTimeout(_pendingBuildTimer);
+                _pendingBuildTimer = null;
+                _pendingBuildFile = _buildingFile = _lastSeenFile = null;
+            },
+            resume() {
+                if (!currentSongPoll) currentSongPoll = setInterval(pollCurrentSong, 2000);
+                const song = window.slopsmith && window.slopsmith.currentSong;
+                if (song && song.filename) triggerBuild(song.filename, 'amp-sims-enabled');
+            },
+        });
     }
     hook();
 })();
@@ -4073,6 +4279,8 @@ async function rbInit() {
 // 12x-from-1s loop that crashed app launch — few attempts, 7s apart, and it
 // stops the moment it plays (or if the tone is disabled/empty).
 function rbScheduleDefaultToneIdleLoad() {
+    if (!RbAmpPolicy.allowed()) return;
+    const policyToken = RbAmpPolicy.token();
     let tries = 0;
     const attempt = async () => {
         tries++;
@@ -4084,12 +4292,13 @@ function rbScheduleDefaultToneIdleLoad() {
         if (!engineBusy && !rbState._defaultToneActive) {
             await rbReloadDefaultTone().catch(() => {});
         }
+        if (!RbAmpPolicy.current(policyToken)) return;
         if (!rbState._defaultToneActive && tries < 4
             && window.__rbDefaultToneSetting !== false && rbDefaultToneHasContent()) {
-            setTimeout(attempt, 7000);
+            RbAmpPolicy.later(attempt, 7000);
         }
     };
-    setTimeout(attempt, 5000);
+    RbAmpPolicy.later(attempt, 5000);
 }
 
 function rbBanner(color, title, body) {
@@ -6295,6 +6504,7 @@ let _rbGrPoll = null;
 function rbStopGrMeterPoll() { if (_rbGrPoll) { clearInterval(_rbGrPoll); _rbGrPoll = null; } }
 function rbStartGrMeterPoll(canvas, piece, idx, stem) {
     rbStopGrMeterPoll();
+    if (!RbAmpPolicy.allowed()) return;
     if (stem !== 'hzx') return;
     const api = rbAudioApi();
     if (!api || typeof api.getParameters !== 'function' || !window.RBPedalCanvas) return;
@@ -6348,6 +6558,7 @@ function rbClearActiveVstFace(piece) {
 }
 function rbStartNativeParamSync(api, slotId, piece) {
     rbStopNativeParamSync();
+    if (!RbAmpPolicy.allowed()) return;
     if (!api || typeof api.getParameters !== 'function' || slotId == null || !piece) return;
     let last = null, lastSig = null, busy = false, misses = 0;
     _rbNativeParamPoll = setInterval(async () => {
@@ -7332,14 +7543,23 @@ window.rbStudioShowSavedTone = function rbStudioShowSavedTone(name) {
 // leveler, THEN un-mute. The re-apply's setParameter transients stay under the
 // rbPreLoadMute mute; we lift it fast afterwards (event-driven, not the timer).
 async function rbStudioFinishMonitorLoad(api, chain) {
+    const policyToken = api && api.__rbToneEpoch != null ? api.__rbToneEpoch : RbAmpPolicy.token();
+    if (!RbAmpPolicy.current(policyToken)) return;
     if (!Array.isArray(chain)) chain = [];
     try { await rbReapplyBypassToChain(api, chain); } catch (_) {}
+    if (!RbAmpPolicy.current(policyToken)) return;
     try { await rbReapplyVstParamsToChain(api, chain); } catch (_) {}
+    if (!RbAmpPolicy.current(policyToken)) return;
     try { await rbApplyChainInputDrive({ chain }); } catch (_) {}
+    if (!RbAmpPolicy.current(policyToken)) return;
     try { await rbStudioApplyStereoToEngine(); } catch (_) {}   // re-apply pan/branch after a chain (re)load
+    if (!RbAmpPolicy.current(policyToken)) return;
     try { await rbAdvApplyConnectivity(); } catch (_) {}        // bypass graph-disconnected gear
+    if (!RbAmpPolicy.current(policyToken)) return;
     try { await rbStartFinalChainNormalizer(chain); } catch (_) {}
+    if (!RbAmpPolicy.current(policyToken)) return;
     if (api.startAudio) await api.startAudio().catch(() => {});
+    if (!RbAmpPolicy.current(policyToken)) return;
     try { await rbSignalChainLoaded(); } catch (_) {}   // un-mute AFTER the re-apply
     // Belt-and-braces second pass: on a COLD first load the chain's plugins may
     // not be fully instantiated when the re-apply above runs, so setParameter
@@ -7354,8 +7574,8 @@ async function rbStudioFinishMonitorLoad(api, chain) {
         if (rbState.listeningTone != null || rbState._auditionId) return;   // playback owns the engine
         rbReapplyVstParamsToChain(api, chain).catch(() => {});
     };
-    setTimeout(_reapplySettled, 350);
-    setTimeout(_reapplySettled, 900);
+    RbAmpPolicy.later(_reapplySettled, 350);
+    RbAmpPolicy.later(_reapplySettled, 900);
 }
 
 // Load the CURRENTLY-SELECTED studio tone into the live monitor so switching
@@ -7379,6 +7599,8 @@ function rbResetOverrideLoaded() { _rbOverrideLoadedKey = null; }
 // Studio tone by name (falls back to Default if it's gone). Returns true only
 // when a tone actually loaded, so callers can retry on failure.
 async function rbLoadOverrideTone() {
+    if (!RbAmpPolicy.allowed()) return false;
+    const policyToken = RbAmpPolicy.token();
     const api = rbAudioApi();
     if (!api) return false;
     const name = rbToneOverride.name || '';
@@ -7407,7 +7629,9 @@ async function rbLoadOverrideTone() {
         try { if (typeof rbCloseActiveVstEditor === 'function') await rbCloseActiveVstEditor(); } catch (_) {}
         delete payload.id;   // force the legacy monitor path (executor route is silent at idle)
         await rbLoadNativePresetPayload(api, payload, { mode: 'preview', authorization: 'user-action' });
+        if (!RbAmpPolicy.current(policyToken)) return false;
         try { await rbStudioFinishMonitorLoad(api, payload.native_preset.chain); } catch (_) {}
+        if (!RbAmpPolicy.current(policyToken)) return false;
         rbState._defaultToneActive = true;
         return true;
     } catch (e) { console.warn('[rig_builder] tone override load failed:', e); return false; }
@@ -7418,10 +7642,12 @@ async function rbLoadOverrideTone() {
 // The key is stamped only AFTER a successful load, so a failed load retries on
 // the next tone-change re-apply instead of being marked done.
 async function rbLoadOverrideToneForSong(filename) {
+    if (!RbAmpPolicy.allowed()) return;
+    const policyToken = RbAmpPolicy.token();
     const key = (filename || '') + '|' + (rbToneOverride.name || '');
     if (_rbOverrideLoadedKey === key) return;
     const ok = await rbLoadOverrideTone();
-    if (ok) _rbOverrideLoadedKey = key;
+    if (ok && RbAmpPolicy.current(policyToken)) _rbOverrideLoadedKey = key;
 }
 
 // Fill the Setup dropdown with Default + the user's saved Studio tones.
@@ -7571,6 +7797,8 @@ function rbHotkeyBoundSavedToneIds() {
 // Sequentially prefetch + cache the bound saved tones' preset payloads. Background
 // only, low priority (gap between fetches), idempotent, superseded-safe.
 async function rbWarmHotkeyTones() {
+    if (!RbAmpPolicy.allowed()) return;
+    const policyToken = RbAmpPolicy.token();
     if (window.__rbWarmHotkeyTones === false) return;
     const ids = rbHotkeyBoundSavedToneIds();
     // Drop cache entries for tones no longer bound to any key.
@@ -7581,14 +7809,15 @@ async function rbWarmHotkeyTones() {
     const gen = ++_rbHotkeyWarmGen;
     let fetched = 0;
     for (const id of ids) {
-        if (gen !== _rbHotkeyWarmGen) return;                    // a newer warm took over
+        if (gen !== _rbHotkeyWarmGen || !RbAmpPolicy.current(policyToken)) return;
         const hit = _rbHotkeyToneCache.get(id);
         if (hit && (Date.now() - hit.ts) < RB_HOTKEY_WARM_TTL) continue;   // still fresh
         try {
             const r = await fetch(`${window.RB_API}/native_preset_full/${id}`);
-            if (gen !== _rbHotkeyWarmGen) return;
+            if (gen !== _rbHotkeyWarmGen || !RbAmpPolicy.current(policyToken)) return;
             if (r.ok) {
                 const text = await r.text();
+                if (gen !== _rbHotkeyWarmGen || !RbAmpPolicy.current(policyToken)) return;
                 let ok = false;
                 try { const p = JSON.parse(text); ok = !!(p && p.native_preset); } catch (_) {}
                 if (ok) { _rbHotkeyToneCache.set(id, { text, ts: Date.now() }); fetched++; }
@@ -7604,7 +7833,7 @@ async function rbWarmHotkeyTones() {
 // Debounced trigger — bindings/saved-tones can change in bursts.
 function rbScheduleHotkeyWarm(delay) {
     if (_rbHotkeyWarmTimer) clearTimeout(_rbHotkeyWarmTimer);
-    _rbHotkeyWarmTimer = setTimeout(() => {
+    _rbHotkeyWarmTimer = RbAmpPolicy.later(() => {
         _rbHotkeyWarmTimer = null;
         rbWarmHotkeyTones().catch(() => {});
     }, delay == null ? 1500 : delay);
@@ -11826,6 +12055,8 @@ function rbDefaultToneHasContent() {
 // SYNC the audio-effects capability so the host actually routes input through
 // it (without that select-chain dispatch the plan loads but stays silent).
 async function rbLoadDefaultTone(options) {
+    if (!RbAmpPolicy.allowed()) return false;
+    const policyToken = RbAmpPolicy.token();
     const api = rbAudioApi();
     if (!api) return false;
     const r = await fetch(`${window.RB_API}/default_tone/native`);
@@ -11844,6 +12075,7 @@ async function rbLoadDefaultTone(options) {
     // A prior Listen/song may have left the monitor muted — unmute it.
     if (api.setMonitorMute) await api.setMonitorMute(false).catch(() => {});
     if (api.startAudio) await api.startAudio().catch(() => {});
+    if (!RbAmpPolicy.current(policyToken)) return false;
     rbState._defaultToneActive = true;
     return true;
 }
@@ -11858,7 +12090,10 @@ async function rbLoadDefaultTone(options) {
 // untouched. Persists to /settings (rig_builder_enabled).
 async function rbSetRigBuilderEnabled(on) {
     on = !!on;
+    const clearActiveLegacy = !on && RbAmpPolicy.allowed() && RbMegaChain.isActive();
     window.__rbEnabled = on;
+    // Cancel immediately, before the settings POST can yield to an old load.
+    const cleanup = !on ? RbAmpPolicy.suspend(clearActiveLegacy) : null;
     rbUpdateRigBuilderEnabledUI();
     try {
         await fetch(`${window.RB_API}/settings`, {
@@ -11870,10 +12105,10 @@ async function rbSetRigBuilderEnabled(on) {
         // Remove Rig Builder's current presence from the shared engine via the
         // host route-release (leaves the user's own chain intact; only falls
         // back to clearChain on a host that doesn't support the handoff).
-        try { if (typeof RbMegaChain !== 'undefined') await RbMegaChain.teardown(false); } catch (_) {}
-        try { await rbReleaseAudioEffectsRouteWithHost('rig-builder-disabled'); } catch (_) {}
+        await cleanup;
         rbState._defaultToneActive = false;
     } else {
+        await RbAmpPolicy.resume();
         // Re-enable: reload the right tone (current song, else the idle default).
         const cur = window.slopsmith && window.slopsmith.currentSong;
         const filename = cur && cur.filename;
@@ -11889,6 +12124,8 @@ function rbUpdateRigBuilderEnabledUI() {
 }
 
 async function rbReloadDefaultTone() {
+    if (!RbAmpPolicy.allowed()) return false;
+    const policyToken = RbAmpPolicy.token();
     // Master Rig Builder switch off → never load the idle default tone into
     // the engine (see Gear "Rig Builder: ON/OFF").
     if (window.__rbEnabled === false) return false;
@@ -11899,16 +12136,19 @@ async function rbReloadDefaultTone() {
     if (enabled === undefined || !(rbState.master.default || []).length) {
         try {
             const d = await (await fetch(`${window.RB_API}/default_tone`)).json();
+            if (!RbAmpPolicy.current(policyToken)) return false;
             enabled = !!d.enabled;
             window.__rbDefaultToneSetting = enabled;
             rbState.master.default = Array.isArray(d.pieces) ? d.pieces : [];
             try { rbApplyToneGate(d.gate, {}); } catch (_) {}
         } catch (_) {}
     }
+    if (!RbAmpPolicy.current(policyToken)) return false;
     if (!enabled) { rbState._defaultToneActive = false; return false; }
     if (!rbDefaultToneHasContent()) { rbState._defaultToneActive = false; return false; }
     try {
         const ok = await rbLoadDefaultTone();
+        if (!RbAmpPolicy.current(policyToken)) return false;
         // The reload rebuilt the chain pieces from the backend (which doesn't
         // store pan), so the panning would be lost on app restart. Restore it
         // from the saved graph (localStorage holds node.pan) + re-apply stereo.
@@ -11916,7 +12156,7 @@ async function rbReloadDefaultTone() {
         // Pre-warm the cab variants so the FIRST Cab Room entry is instant (Studio
         // view only, deferred so it never blocks the tone load).
         if (ok && document.getElementById('rb-studio-room'))
-            setTimeout(() => { try { rbStudioWarmCabVariants(); } catch (_) {} }, 1500);
+            RbAmpPolicy.later(() => { try { rbStudioWarmCabVariants(); } catch (_) {} }, 1500);
         return ok;
     }
     catch (e) { return false; }
@@ -14156,7 +14396,7 @@ function rbReapplyVstParamsAfterLoad(chainSpec, delayMs) {
     if (!chainSpec || !Array.isArray(chainSpec)) return;
     const hasVst = chainSpec.some(s => s && s.type === 0);
     if (!hasVst) return;        // no point scheduling work
-    setTimeout(() => {
+    RbAmpPolicy.later(() => {
         const api = rbAudioApi();
         if (!api) return;
         rbReapplyVstParamsToChain(api, chainSpec).catch((e) =>
@@ -14501,7 +14741,7 @@ async function rbSaveTonePreset(toneIdx, filename) {
 
 // Native desktop audio engine, or null (e.g. browser/WASM-only mode).
 function rbNativeAudio() {
-    const a = window.feedBackDesktop && window.feedBackDesktop.audio;
+    const a = rbAudioApi();
     return (a && typeof a.loadPreset === 'function' && typeof a.startAudio === 'function') ? a : null;
 }
 
@@ -21800,3 +22040,29 @@ window.rbAdvTogglePhase = rbAdvTogglePhase;
 window.rbAdvEditNode = rbAdvEditNode;
 window.rbAdvCloseEditor = rbAdvCloseEditor;
 window.rbAdvZoom = rbAdvZoom;
+
+// Subscribe only after every hook's state has been initialized: subscribe()
+// delivers its first snapshot synchronously during plugin bootstrap.
+RbAmpPolicy.register({
+    stop() {
+        rbStopFinalChainNormalizer();
+        rbStopGrMeterPoll();
+        rbStopNativeParamSync();
+        _rbUnmuteRun = null;
+        if (_rbUnmuteTimer) clearTimeout(_rbUnmuteTimer);
+        _rbUnmuteTimer = null;
+        _rbUnmuteDeadline = 0;
+        _rbMuteInFlight = false;
+        ++_rbHotkeyWarmGen;
+        if (_rbHotkeyWarmTimer) clearTimeout(_rbHotkeyWarmTimer);
+        _rbHotkeyWarmTimer = null;
+        rbResetOverrideLoaded();
+        rbState._defaultToneActive = false;
+    },
+    resume() {
+        rbScheduleHotkeyWarm();
+        const song = window.slopsmith && window.slopsmith.currentSong;
+        if (!song || !song.filename) rbScheduleDefaultToneIdleLoad();
+    },
+});
+RbAmpPolicy.connect();

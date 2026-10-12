@@ -14,6 +14,18 @@ a VST or a NAM to any piece.
 > finds/assigns the captures and persists the full chain; `nam_tone` plays it
 > back.
 
+On Desktop, turning **Use amp simulations** off suspends Rig's automatic tone
+loading, normalizer, tone polls and prefetch. It preserves the Rig master switch,
+saved tones, calibration and library. Pending native calls drain before Desktop
+clears internal effects; backing audio and input capture remain available.
+The materialization watcher closes its directory notifications and waits for a
+policy/settings change. Re-enabling starts a fresh library baseline rather than
+seeding files that appeared while disabled. A seeding operation already inside a
+file read or download finishes that call, then cancels at the next tone/piece
+boundary without persisting a partially built preset. Existing explicit batch
+jobs are independent of this preference. Older hosts without the policy and
+pure browser sessions keep their prior behavior.
+
 ---
 
 ## Features

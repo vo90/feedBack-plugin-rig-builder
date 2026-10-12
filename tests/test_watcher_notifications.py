@@ -304,6 +304,14 @@ def test_loop_closes_owned_gate_on_stop_and_keeps_interval(routes, monkeypatch):
             actions.append(("wait", seconds))
             self.stopped = True
 
+    class Condition:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def wait(self, seconds):
+            routes._watcher_stop.wait(seconds)
+
     class Gate:
         def __init__(self, *args):
             pass
@@ -314,6 +322,8 @@ def test_loop_closes_owned_gate_on_stop_and_keeps_interval(routes, monkeypatch):
             actions.append("close")
 
     monkeypatch.setattr(routes, "_watcher_stop", Stop())
+    monkeypatch.setattr(routes, "_watcher_condition", Condition())
+    monkeypatch.setattr(routes, "_load_settings", lambda: {})
     monkeypatch.setattr(routes, "_WatchScanGate", Gate)
     routes._watch_loop()
     assert actions == ["scan", ("wait", 5), "close"]
