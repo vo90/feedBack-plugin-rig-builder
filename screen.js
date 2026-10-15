@@ -505,15 +505,27 @@ function rbConfiguredChainInputDrive() {
         ? window.__rbChainInputDrive : 8.0;
 }
 
-// Clean input-level calibration trim (linear ×, persisted as nam_input_calibration).
-// This is a FLAT multiplier applied on top of the amp-drive in rbApplyChainInputDrive
-// (engine input = drive × calibration). It's what the "Input" fader shows/edits and
-// what the note-detect Calibration Wizard writes (raw DI → −12 dBFS). Unlike the
-// drive baseline it has NO clean floor, so a reduction (e.g. 0.7× ≈ −3 dB) really
-// lowers the level. Default 1.0 = 0 dB = no trim (identical to the old behaviour).
+function rbGuitarProfiles() {
+    return window.feedBack?.guitarProfiles || null;
+}
+
+// The Input controls show the selected guitar's flat calibration trim. Older
+// hosts keep this value in nam_input_calibration and combine it with tone drive.
+// Profile-aware hosts apply it once in the dedicated input calibration stage.
 function rbInputCalibration() {
+    const profiles = rbGuitarProfiles();
+    if (profiles) {
+        const gain = Number(profiles.getSnapshot().gain);
+        return Number.isFinite(gain) && gain > 0 ? gain : 1.0;
+    }
     return (typeof window.__rbInputCalibration === 'number' && window.__rbInputCalibration > 0)
         ? window.__rbInputCalibration : 1.0;
+}
+
+function rbChainInputCalibration() {
+    // The host's dedicated input stage already applies the selected guitar's
+    // calibration. Tone reloads must only change drive, never apply it twice.
+    return rbGuitarProfiles() ? 1.0 : rbInputCalibration();
 }
 
 function rbCleanGuitarChainInputDrive(maxDrive) {
@@ -609,12 +621,9 @@ function rbApplyChainInputDrive(opts) {
     const token = RbAmpPolicy.token();
     // While the node graph is disconnected (Input/Output unwired) the chain is
     // silenced at the source — keep it silent even if a scheduled re-poll fires.
-    // The clean calibration trim (rbInputCalibration) rides on top of the
-    // amp-drive: engine input = drive × calibration. This is the ONE place that
-    // owns the engine 'input' node, so the Calibration Wizard's −12 dBFS result
-    // (handed to us as nam_input_calibration) and the amp drive combine into a
-    // single value instead of overwriting each other.
-    const drive = rbState._advSilenced ? 0 : (rbDriveForChainInput(opts) * rbInputCalibration());
+    // Older hosts combine calibration and drive here. Profile-aware hosts own
+    // calibration in a dedicated stage, so this node controls tone drive only.
+    const drive = rbState._advSilenced ? 0 : (rbDriveForChainInput(opts) * rbChainInputCalibration());
     // Re-poll guard: the song-playback callers fire this ~600 ms after
     // the bundle's chain load — but `highway.getStringCount()` may not
     // have absorbed the song_info WS message yet (it defaults to 6
@@ -1168,6 +1177,12 @@ function rbLinToDb(lin) {
     return (x > 1.0e-4) ? rbClampLevelDb(20 * Math.log10(x)) : RB_LEVEL_DB_MIN;
 }
 function rbFmtDb(db) { const v = rbClampLevelDb(db); return (v > 0 ? '+' : '') + v.toFixed(1) + ' dB'; }
+const RB_PROFILE_DB_MIN = -20, RB_PROFILE_DB_MAX = 20 * Math.log10(5);
+function rbInputLevelDb() {
+    if (!rbGuitarProfiles()) return rbLinToDb(rbInputCalibration());
+    return Math.max(RB_PROFILE_DB_MIN, Math.min(RB_PROFILE_DB_MAX, 20 * Math.log10(rbInputCalibration())));
+}
+function rbFormatInputDb(db) { return (db > 0 ? '+' : '') + db.toFixed(1) + ' dB'; }
 
 // "AMP" output trim. Persists to /settings (chain_makeup, a linear ×) and applies
 // LIVE post-leveler (Output Trim) or via setGain('chain', base × trim). The fader
@@ -1204,25 +1219,79 @@ async function rbSetChainMakeup(dbIn) {
     }).catch(() => {});
 }
 
-// "Input" — the clean input-level trim (calibration), shown in dB. This is the
-// value the note-detect Calibration Wizard normalizes to −12 dBFS, surfaced on
-// the fader so the wizard's result is visible and editable here. It rides ON TOP
-// of the automatic amp-drive (engine input = drive × this), so a reduction really
-// lowers the level even where the guitar drive floor would otherwise pin it.
-// Default 0 dB (1×) = no trim = identical to the old behaviour. Persists to
-// /settings (nam_input_calibration) and re-applies live via rbApplyChainInputDrive.
-// (The amp-DRIVE baseline lives in nam_chain_input_drive — internal/auto now.)
-async function rbSetDesktopInput(dbIn) {
-    const d = rbClampLevelDb(dbIn);
-    const val = rbDbToLin(d);   // linear × for the engine + persisted setting
-    window.__rbInputCalibration = val;
+// Input calibration is shown in dB and saved through the shared guitar service.
+// Without that service, preserve the legacy global setting and tone-node trim.
+function rbSyncInputCalibrationUi(error) {
+    const d = rbInputLevelDb();
     const el = document.getElementById('rb-amp-drive-val');
-    if (el) el.textContent = rbFmtDb(d);
+    if (el) el.textContent = rbFormatInputDb(d);
     // Keep the Setup knob visually in sync when the change came from the in-game
     // "Input" fader (set() only re-renders, no onChange → no loop).
     if (window.__rbDesktopInputKnob && typeof window.__rbDesktopInputKnob.set === 'function') {
         try { window.__rbDesktopInputKnob.set(d); } catch (_) {}
     }
+    const name = document.getElementById('rb-input-guitar-name');
+    if (name) {
+        const snapshot = rbGuitarProfiles()?.getSnapshot();
+        name.textContent = error ? 'Input changed; adjust again' : (snapshot?.activeName || '');
+        name.title = error ? String(error.message || error) : (snapshot?.routeLabel || '');
+    }
+}
+
+let rbProfileGainWrite = Promise.resolve();
+let rbProfileGainPending = 0;
+const rbProfileGainRevisions = new Map();
+function rbProfileGainRevisionKey(context) {
+    return JSON.stringify([context.profileId, context.routeKey, context.revision]);
+}
+async function rbSetDesktopInput(dbIn) {
+    const profiles = rbGuitarProfiles();
+    const d = profiles ? Math.max(RB_PROFILE_DB_MIN, Math.min(RB_PROFILE_DB_MAX, Number(dbIn) || 0)) : rbClampLevelDb(dbIn);
+    // Bound the linear result too, avoiding rounding just beyond the API limits.
+    const val = profiles ? Math.max(0.1, Math.min(5, Math.pow(10, d / 20))) : rbDbToLin(d);
+    if (profiles) {
+        // Serialize a dragging knob's writes. Preserve the guitar/input that
+        // received the gesture, so switching guitar cannot redirect an edit.
+        ++rbProfileGainPending;
+        const requested = profiles.captureContext().then(context => ({ context }), error => ({ error }));
+        const operation = rbProfileGainWrite.then(async () => {
+            // captureContext waits for initialization and can retry a failed
+            // startup; the one-shot ready promise may already be rejected.
+            const request = await requested;
+            if (request.error) throw request.error;
+            const original = request.context;
+            const current = await profiles.captureContext();
+            if (current.profileId !== original.profileId || current.routeKey !== original.routeKey) {
+                throw new Error('The selected guitar or input changed before the adjustment was saved.');
+            }
+            // Only our own preceding knob writes may advance this gesture's
+            // revision. Calibration, renames, or switching away and back must
+            // invalidate queued edits even if the current guitar/input matches.
+            let revision = original.revision;
+            while (revision !== current.revision) {
+                const next = rbProfileGainRevisions.get(rbProfileGainRevisionKey({...original, revision}));
+                if (next === undefined || next === revision) break;
+                revision = next;
+            }
+            if (revision !== current.revision) {
+                throw new Error('The guitar profile changed before the adjustment was saved.');
+            }
+            const saved = await profiles.saveGain(val, current, { source: 'manual' });
+            if (saved?.activeId === current.profileId && saved?.routeKey === current.routeKey) {
+                rbProfileGainRevisions.set(rbProfileGainRevisionKey(current), saved.revision);
+            }
+            rbSyncInputCalibrationUi();
+        }).catch(error => {
+            console.warn('[rig_builder] Guitar input adjustment was not saved:', error);
+            rbSyncInputCalibrationUi(error);
+        }).finally(() => {
+            if (--rbProfileGainPending === 0) rbProfileGainRevisions.clear();
+        });
+        rbProfileGainWrite = operation;
+        return operation;
+    }
+    window.__rbInputCalibration = val;
+    rbSyncInputCalibrationUi();
     rbApplyChainInputDrive();   // re-applies respecting bass detection
     fetch(`${window.RB_API}/settings`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1240,8 +1309,19 @@ window.addEventListener('rig-builder:set-input-calibration', (e) => {
     const g = e && e.detail && Number(e.detail.gain);
     if (!Number.isFinite(g) || g <= 0) return;
     try { if (typeof e.detail.ack === 'function') e.detail.ack(); } catch (_) {}
+    // Profile-aware calibration saves through the shared service with its
+    // captured guitar/input context. An old, unscoped event must not save again.
+    if (rbGuitarProfiles()) { rbSyncInputCalibrationUi(); return; }
     rbSetDesktopInput(rbLinToDb(g));
 });
+
+const rbProfiles = rbGuitarProfiles();
+if (rbProfiles) {
+    rbProfiles.subscribe(() => rbSyncInputCalibrationUi());
+    Promise.resolve(rbProfiles.ready).then(() => rbSyncInputCalibrationUi()).catch(error => {
+        console.warn('[rig_builder] Guitar profiles could not be loaded:', error);
+    });
+}
 
 // ── In-game mixer faders: "Input" + "AMP" ──────────────────────────────────
 // rig_builder owns BOTH the level faders the player sees while playing, so Setup
@@ -1278,9 +1358,10 @@ function rbRegisterLevelFaders() {
         ownerPluginId: 'rig_builder',
         kind: 'plugin',
         unit: 'dB',
-        min: RB_LEVEL_DB_MIN, max: RB_LEVEL_DB_MAX, step: 0.5,
+        min: rbGuitarProfiles() ? RB_PROFILE_DB_MIN : RB_LEVEL_DB_MIN,
+        max: rbGuitarProfiles() ? RB_PROFILE_DB_MAX : RB_LEVEL_DB_MAX, step: 0.5,
         defaultValue: 0,
-        getValue: () => rbLinToDb(rbInputCalibration()),
+        getValue: rbInputLevelDb,
         setValue: (v) => { rbSetDesktopInput(v); },
     });
     api.registerFader({
@@ -20075,12 +20156,17 @@ async function rbLoadSettings() {
     // Reflects the clean input calibration trim (nam_input_calibration), including
     // edits made via the in-game fader during songs and the Calibration Wizard's
     // −12 dBFS result handed to us via rig-builder:set-input-calibration.
-    const advDb = rbLinToDb(rbInputCalibration());
+    const advDb = rbInputLevelDb();
     if (!window.__rbDesktopInputKnob)
-        window.__rbDesktopInputKnob = rbAttachKnob('rb-amp-drive-knob', { min: RB_LEVEL_DB_MIN, max: RB_LEVEL_DB_MAX, def: 0, value: advDb, onChange: rbSetDesktopInput });
+        window.__rbDesktopInputKnob = rbAttachKnob('rb-amp-drive-knob', {
+            min: rbGuitarProfiles() ? RB_PROFILE_DB_MIN : RB_LEVEL_DB_MIN,
+            max: rbGuitarProfiles() ? RB_PROFILE_DB_MAX : RB_LEVEL_DB_MAX,
+            def: 0, value: advDb, onChange: rbSetDesktopInput,
+        });
     else window.__rbDesktopInputKnob.set(advDb);
     const adVal = document.getElementById('rb-amp-drive-val');
-    if (adVal) adVal.textContent = rbFmtDb(advDb);
+    if (adVal) adVal.textContent = rbFormatInputDb(advDb);
+    rbSyncInputCalibrationUi();
     // "AMP" output knob — shown in dB, default 0 dB.
     window.__rbChainMakeup = (typeof s.chain_makeup === 'number') ? s.chain_makeup : 1.0;
     const ampDb = rbLinToDb(window.__rbChainMakeup);

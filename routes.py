@@ -8904,6 +8904,8 @@ def setup(app, context):
             # at every chain load — value of 8.0 = +18 dB feeds NAM amps
             # at capture-time levels so they actually saturate.
             "nam_chain_input_drive": float(s.get("nam_chain_input_drive", 1.0)),
+            # Legacy calibration is also read once when migrating to guitar profiles.
+            "nam_input_calibration": float(s.get("nam_input_calibration", 1.0)),
             # User "Output chain" / chain-volume trim (setGain('chain')
             # multiplier). Range 0–5, default 1× (the knob value IS the multiplier).
             "chain_makeup": float(s.get("chain_makeup", 1.0)),
